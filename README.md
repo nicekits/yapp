@@ -98,86 +98,36 @@ hanya menambah sheet dan kolom yang belum ada.
 3. Jalankan `setup()` sekali untuk menambah kolom baru: `direct_key`, `kind`, `reply_json`, `conv_id`, `thumb_data`.
 4. Deploy versi baru.
 
-## Deploy via GitHub (tanpa command line, kecuali 1 langkah sekali di awal)
+## Simpan kode di GitHub (tanpa terminal, cukup drag & drop)
 
-Anda tidak perlu belajar `git` di terminal. Upload/edit file di GitHub bisa lewat
-**drag & drop di web browser**, sama seperti kebiasaan Anda selama ini di editor Apps Script.
-Hanya ADA SATU langkah (langkah 4 di bawah) yang butuh membuka terminal sekali seumur hidup
-proyek ini, untuk mengambil "kunci" yang nantinya dipakai GitHub secara otomatis.
+GitHub di sini dipakai sebagai **cadangan kode + riwayat perubahan** saja — bukan untuk
+otomatis men-deploy ke Apps Script. Jadi tidak perlu `git`, tidak perlu `clasp`, tidak perlu
+buka terminal sama sekali. Deploy ke web app tetap dilakukan manual seperti biasa (lihat
+bagian "Cara memasang" / "Memperbarui kode" di atas).
 
-Tiga istilah dulu biar tidak bingung:
+**1. Buat repo di GitHub**
 
-| Istilah | Maksudnya | Punya Anda |
-| --- | --- | --- |
-| **Script ID** | ID proyek Apps Script-nya sendiri | Dilihat di editor → Project Settings |
-| **Deployment ID** | ID dari satu link `/exec` tertentu | `AKfycbyhYvR2MOKsHJNO6ZaS5fkSwKA0vt7hk9k5VwFEoLrA-LhHleoElDhL_m_1Sq4sX5GgUw` — ini diambil dari link web app Anda: `.../macros/s/`**`<deployment-id>`**`/exec` |
-| **Kredensial clasp** | "Izin login" supaya GitHub boleh menulis ke Apps Script Anda | Didapat sekali lewat `clasp login` (langkah 4) |
+Buka github.com → tombol **+** di pojok kanan atas → **New repository** → beri nama
+(misal `yapp-gas`) → **Create repository**.
 
-Deployment ID di atas penting: supaya **link `/exec` yang sudah Anda bagikan ke anggota
-tidak berubah**, update otomatis harus menimpa deployment itu juga, bukan cuma menyimpan kode.
+**2. Upload file lewat drag & drop**
 
-**1. Buat repo di GitHub (lewat web, tanpa CLI)**
+Di halaman repo kosong tadi, klik **uploading an existing file** (atau menu
+**Add file → Upload files**). Extract isi zip yang saya kirim, lalu seret **semua isi
+folder `yapp/`** (bukan folder `yapp` itu sendiri — isinya saja: `Code.gs`, `index.html`,
+`README.md`, dst.) ke kotak upload itu, lalu klik **Commit changes**.
+> Folder `uji-lokal/` boleh ikut diupload atau dilewati — itu hanya dipakai untuk tes oleh
+> pengembang, tidak dibutuhkan Apps Script maupun GitHub.
 
-Buka github.com → tombol **+** → **New repository** → beri nama (misal `yapp-gas`) → **Create repository**.
+**3. Selesai**
 
-**2. Upload semua file proyek (drag & drop, seperti biasa)**
+Kode YAPP sekarang tersimpan di GitHub sebagai cadangan. Setiap kali ada kode baru dari
+saya (atau perubahan yang Anda buat sendiri di editor Apps Script), Anda bisa menyalin
+ulang file yang berubah ke GitHub dengan cara yang sama: klik file di GitHub → ikon pensil
+untuk edit langsung, atau **Add file → Upload files** untuk mengganti beberapa file sekaligus.
 
-Di halaman repo kosong tadi, klik **uploading an existing file** (atau menu **Add file → Upload files**).
-Extract isi zip yang saya kirim, lalu **seret SEMUA ISI folder `yapp/`** (bukan folder `yapp` itu
-sendiri — isinya saja: `Code.gs`, `index.html`, dst, termasuk folder `.github`) ke kotak upload itu,
-lalu **Commit changes**.
-> Folder `uji-lokal/` boleh ikut diupload atau dilewati (hanya dipakai pengembang untuk tes, tidak
-> dibutuhkan Apps Script).
-
-**3. Ambil Script ID**
-
-Buka proyek Apps Script Anda di script.google.com → ikon gerigi **Project Settings** di sidebar kiri
-→ salin **Script ID** di bagian atas.
-
-**4. Satu-satunya langkah pakai terminal: ambil kredensial clasp**
-
-Di komputer Anda (bukan di sini), install [Node.js](https://nodejs.org) kalau belum ada, lalu buka
-Terminal/Command Prompt dan jalankan:
-```
-npm install -g @google/clasp
-clasp login
-```
-Browser akan terbuka, login dengan **akun Gmail yang sama dengan pemilik script ini**, lalu izinkan.
-Setelah itu, sebuah file `.clasprc.json` tersimpan di folder home Anda (`C:\Users\<nama>\.clasprc.json`
-di Windows, atau `~/.clasprc.json` di Mac/Linux). Buka file itu dengan Notepad/TextEdit, dan **salin
-semua isinya** (satu baris JSON panjang) — akan ditempel ke GitHub di langkah berikutnya.
-Juga aktifkan dulu Apps Script API di <https://script.google.com/home/usersettings> (nyalakan toggle-nya)
-kalau `clasp login` gagal.
-
-**5. Masukkan 3 "kunci" ke GitHub (lewat web)**
-
-Di repo GitHub Anda: **Settings → Secrets and variables → Actions → New repository secret**.
-Buat 3 secret ini satu per satu:
-
-| Nama secret | Isi |
-| --- | --- |
-| `CLASP_SCRIPT_ID` | Script ID dari langkah 3 |
-| `CLASP_DEPLOYMENT_ID` | `AKfycbyhYvR2MOKsHJNO6ZaS5fkSwKA0vt7hk9k5VwFEoLrA-LhHleoElDhL_m_1Sq4sX5GgUw` (deployment Anda saat ini) |
-| `CLASP_CREDENTIALS` | Seluruh isi `.clasprc.json` dari langkah 4, apa adanya |
-
-**6. Selesai — cek hasilnya**
-
-Buka tab **Actions** di repo GitHub Anda. Setelah upload di langkah 2, workflow **"Deploy ke Google
-Apps Script"** otomatis berjalan (ikon kuning → hijau kalau sukses). Kalau belum sempat jalan (karena
-secret baru diisi setelah upload), klik workflow itu → **Run workflow** untuk menjalankannya ulang.
-Setelah hijau, buka link `/exec` Anda — kode terbaru sudah aktif di sana.
-
-**Untuk update selanjutnya:** tinggal edit file langsung di GitHub (klik file → ikon pensil) atau
-upload ulang file yang berubah lewat **Add file → Upload files** → **Commit changes**. GitHub Actions
-otomatis menjalankan `clasp push` + memperbarui deployment yang sama, link `/exec` tidak berubah.
-
-**Catatan keamanan:** isi `CLASP_CREDENTIALS` adalah "izin login" ke akun Gmail pemilik script.
-GitHub Secrets terenkripsi dan tidak terlihat siapa pun (termasuk Anda sendiri setelah disimpan,
-dan tidak muncul di log Actions) — tapi jangan pernah tempel isinya di tempat lain.
-
-**Kalau tidak mau pakai GitHub Actions sama sekali:** tidak masalah — simpan kode di GitHub hanya
-sebagai cadangan/riwayat versi, dan tetap deploy manual seperti biasa: drag & drop file ke editor
-Apps Script, lalu **Deploy → Manage deployments → Edit (ikon pensil) → New version → Deploy**.
+Kalau nanti Anda (atau orang lain yang lebih familiar dengan `git`/`clasp`) ingin otomatisasi
+deploy dari GitHub, itu tetap memungkinkan — cukup minta saya siapkan lagi workflow-nya.
 
 ## Penting
 
