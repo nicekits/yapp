@@ -1,0 +1,631 @@
+<script>
+/* js_community — Tahap 3: forum diskusi, materi pembelajaran, pengumuman, agenda kegiatan. */
+(function () {
+  var api = App.api, $ = App.$, $$ = App.$$, ic = App.icon;
+
+  /* ---------- Utilitas bersama ---------- */
+  var richText = App.richText;
+  var errBox = function (main, err) {
+    main.innerHTML = '<div class="main-inner"><div class="card card-pad"><div class="alert alert-error" style="margin:0">' +
+      esc((err && err.message) || 'Gagal memuat data.') + '</div></div></div>';
+  };
+  var bindGo = function (root) {
+    $$('[data-go]', root).forEach(function (a) { a.onclick = function (e) { e.preventDefault(); App.go(a.dataset.go); }; });
+  };
+  var isMod = function () { return ['super_admin', 'admin', 'moderator'].indexOf(App.me.role) >= 0; };
+  /** ISO → nilai input datetime-local (waktu Jakarta, UTC+7). */
+  var toLocalInput = function (iso) {
+    if (!iso) return '';
+    return new Date(new Date(iso).getTime() + 7 * 3600000).toISOString().slice(0, 16);
+  };
+  var when = function (iso) {
+    if (!iso) return '';
+    return new Date(iso).toLocaleString('id-ID', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  };
+  var fileBadge = function (name, mime) {
+    var ext = (String(name || '').split('.').pop() || '').toUpperCase();
+    var cls = { PDF: 'pdf', DOCX: 'doc', PPTX: 'ppt', XLSX: 'xls' }[ext] || (String(mime).indexOf('image/') === 0 ? 'img' : 'doc');
+    return '<span class="file-badge ' + cls + '">' + esc(ext.slice(0, 4) || 'FILE') + '</span>';
+  };
+  var attachmentsHtml = function (list) {
+    if (!list || !list.length) return '';
+    return '<div class="post-atts">' + list.map(function (a) {
+      var data = esc(JSON.stringify({ id: a.id, name: a.name, mime: a.mime }));
+      if (a.kind === 'image' && a.thumb) {
+        return '<button type="button" class="att-img" data-att="' + data + '"><img data-thumb="' + esc(a.id) + '" alt="' + esc(a.name) + '"></button>';
+      }
+      return '<button type="button" class="att-file" data-att="' + data + '">' + fileBadge(a.name, a.mime) + '<span><b>' + esc(a.name) +
+        '</b><small>' + esc(App.fmtSize(a.size || 0)) + '</small></span></button>';
+    }).join('') + '</div>';
+  };
+  var bindAttachments = function (root) {
+    $$('[data-att]', root).forEach(function (b) { b.onclick = function () { App.openAttachment(JSON.parse(b.dataset.att)); }; });
+    App.hydrateThumbs(root);
+  };
+
+  /**
+   * Komponen unggah kecil untuk forum & materi.
+   * mount(el, scope, max) → { ids(), busy(), reset() }
+   */
+  App.uploader = function (el, scope, max) {
+    max = max || 5;
+    var items = [], seq = 0;
+    el.classList.add('uploader');
+    var render = function () {
+      el.innerHTML = '<label class="btn btn-sm">' + ic('clip', 16) + ' Lampirkan file<input type="file" ' + (max > 1 ? 'multiple ' : '') +
+        'accept="' + App.FILE_ACCEPT + '" hidden></label><span class="muted small">JPG, PNG, WEBP, PDF, DOCX, PPTX, XLSX · maks. 5 MB</span>' +
+        '<div class="att-bar">' + items.map(function (u) {
+          return '<span class="up-chip ' + u.status + '" title="' + esc(u.error || u.name) + '">' +
+            (u.preview ? '<img src="' + u.preview + '" alt="">' : ic('file', 18)) + '<span class="up-name">' + esc(u.name) + '</span>' +
+            (u.status === 'uploading' ? '<span class="spinner"></span>' : '') + (u.status === 'error' ? '<span class="up-err">Gagal</span>' : '') +
+            '<button type="button" data-rm="' + u.key + '" title="Hapus">' + ic('close', 14) + '</button></span>';
+        }).join('') + '</div>';
+      $('input[type=file]', el).onchange = function () { add(this.files); };
+      $$('[data-rm]', el).forEach(function (b) {
+        b.onclick = function () { items = items.filter(function (u) { return u.key !== b.dataset.rm; }); render(); };
+      });
+    };
+    var add = function (files) {
+      Array.prototype.slice.call(files || []).forEach(function (file) {
+        if (items.length >= max) { App.toast('Maksimal ' + max + ' lampiran.'); return; }
+        var u = { key: 'f' + (++seq), name: file.name, status: 'uploading' };
+        items.push(u);
+        App.prepareFile(file).then(function (p) {
+          u.preview = p.thumb; render();
+          return api('files.upload', { scope: scope, name: p.name, data: p.data, thumb: p.thumb });
+        }).then(function (meta) {
+          u.status = 'done'; u.meta = meta; u.name = meta.name;
+          if (u.preview) App.thumbCache[meta.id] = u.preview;
+          render();
+        }).catch(function (err) { u.status = 'error'; u.error = err.message || 'Gagal mengunggah.'; render(); });
+      });
+      render();
+    };
+    render();
+    return {
+      ids: function () { return items.filter(function (u) { return u.status === 'done'; }).map(function (u) { return u.meta.id; }); },
+      busy: function () { return items.some(function (u) { return u.status === 'uploading'; }); },
+      reset: function () { items = []; render(); }
+    };
+  };
+
+  /* =================== Forum =================== */
+  var fState = { cat: '', filter: '', q: '', page: 1 };
+
+  function viewForum(main, r) {
+    var sub = r.parts[1];
+    if (sub === 'new') return topicEditor(main, null);
+    if (sub && r.parts[2] === 'edit') return api('forum.get', { discId: sub }).then(function (d) { topicEditor(main, d.topic); })
+      .catch(function (err) { errBox(main, err); });
+    if (sub) return viewTopic(main, sub);
+    forumList(main, false);
+  }
+
+  function forumList(main, append) {
+    api('forum.list', fState).then(function (d) {
+      var items = d.items.map(function (t) {
+        return '<a class="card topic-card" data-go="forum/' + esc(t.disc_id) + '">' +
+          '<div class="topic-top">' + (t.is_pinned ? '<span class="chip chip-red">Disematkan</span>' : '') +
+          (t.is_important ? '<span class="chip chip-amber">Penting</span>' : '') +
+          '<span class="chip chip-blue">' + esc(t.cat_name) + '</span>' + (t.is_locked ? '<span class="chip">Dikunci</span>' : '') + '</div>' +
+          '<h2 class="topic-title">' + esc(t.title) + '</h2><p class="topic-excerpt">' + esc(t.excerpt) + '</p>' +
+          '<div class="topic-meta">' + App.avatar(t.author, 24) + '<span><b>' + esc(t.author.full_name) + '</b> · ' + esc(App.timeAgo(t.created_at)) +
+          '</span><span class="sp"></span><span title="Balasan">' + ic('reply', 15) + ' ' + t.reply_count + '</span>' +
+          '<span title="Reaksi">' + ic('check', 15) + ' ' + t.reaction_count + '</span>' + (t.has_attachments ? '<span title="Ada lampiran">' + ic('clip', 15) + '</span>' : '') +
+          '</div>' + (t.last_reply_by ? '<div class="muted small" style="margin-top:6px">Balasan terakhir oleh ' + esc(t.last_reply_by) + ' · ' + esc(App.timeAgo(t.last_activity_at)) + '</div>' : '') +
+          '</a>';
+      }).join('');
+      if (append) {
+        var box = $('#f-items');
+        box.insertAdjacentHTML('beforeend', items);
+      } else {
+        var chips = '<button class="cat-chip' + (!fState.cat ? ' active' : '') + '" data-cat="">Semua</button>' + d.categories.map(function (c) {
+          return '<button class="cat-chip' + (fState.cat === c.cat_id ? ' active' : '') + '" data-cat="' + esc(c.cat_id) + '">' + esc(c.name) + ' <small>' + c.count + '</small></button>';
+        }).join('');
+        main.innerHTML = '<div class="main-inner"><div class="page-head"><div><h1>Forum Diskusi</h1><p>Tanya, berbagi, dan berdiskusi seputar bahasa Inggris.</p></div>' +
+          '<button class="btn btn-primary" data-go="forum/new">' + ic('pencil', 16) + ' Topik baru</button></div>' +
+          '<div class="cat-chips">' + chips + '</div>' +
+          '<div class="toolbar"><input class="input search" id="f-q" placeholder="Cari topik" value="' + esc(fState.q) + '">' +
+          '<div class="tabs" style="margin:0"><a class="tab' + (!fState.filter ? ' active' : '') + '" data-f="">Terbaru</a>' +
+          '<a class="tab' + (fState.filter === 'important' ? ' active' : '') + '" data-f="important">Penting</a>' +
+          '<a class="tab' + (fState.filter === 'mine' ? ' active' : '') + '" data-f="mine">Topik saya</a></div></div>' +
+          '<div class="topic-list" id="f-items">' + (items || '<div class="card"><div class="empty">' + ic('info', 24) +
+          '<p>Belum ada topik di sini. Mulai diskusi pertama!</p></div></div>') + '</div><div class="pager" id="f-pager"></div></div>';
+        $$('[data-cat]', main).forEach(function (b) { b.onclick = function () { fState.cat = b.dataset.cat; fState.page = 1; forumList(main); }; });
+        $$('[data-f]', main).forEach(function (b) { b.onclick = function () { fState.filter = b.dataset.f; fState.page = 1; forumList(main); }; });
+        var t = null;
+        $('#f-q').oninput = function () {
+          var v = this.value; clearTimeout(t);
+          t = setTimeout(function () { fState.q = v; fState.page = 1; forumList(main); setTimeout(function () { var q = $('#f-q'); q.focus(); q.setSelectionRange(v.length, v.length); }, 0); }, 400);
+        };
+      }
+      var shown = d.page * d.pageSize;
+      $('#f-pager').innerHTML = shown < d.total ? '<button class="btn btn-sm" id="f-more">Muat lagi</button>' : '';
+      var more = $('#f-more');
+      if (more) more.onclick = function () { fState.page++; App.busy(more, true); forumList(main, true); };
+      bindGo(main);
+      App.hydrateAvatars(main);
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  function topicEditor(main, topic) {
+    api('forum.categories').then(function (cats) {
+      main.innerHTML = '<div class="main-inner" style="max-width:760px"><a class="small" data-go="' + (topic ? 'forum/' + esc(topic.disc_id) : 'forum') + '">' +
+        ic('back', 14) + ' Kembali</a><div class="page-head"><div><h1>' + (topic ? 'Ubah topik' : 'Topik baru') + '</h1></div></div>' +
+        '<form class="card card-pad" id="te-form"><div class="alert hidden" id="te-msg"></div>' +
+        '<div class="field"><label>Kategori</label><select class="input" name="cat_id" required><option value="">Pilih kategori</option>' +
+        cats.map(function (c) { return '<option value="' + esc(c.cat_id) + '"' + (topic && topic.cat_id === c.cat_id ? ' selected' : '') + '>' + esc(c.name) + '</option>'; }).join('') +
+        '</select></div><div class="field"><label>Judul</label><input class="input" name="title" maxlength="150" required placeholder="mis. Kapan memakai Present Perfect?" value="' + esc(topic ? topic.title : '') + '"></div>' +
+        '<div class="field"><label>Isi</label><textarea class="input" name="body" maxlength="10000" style="min-height:200px" required placeholder="Jelaskan pertanyaan atau ide Anda. Tautan http(s) otomatis bisa diklik.">' +
+        esc(topic ? topic.body : '') + '</textarea></div>' + (topic ? '' : '<div id="te-up" style="margin-bottom:16px"></div>') +
+        '<div style="display:flex;gap:8px"><button class="btn btn-primary" type="submit">' + (topic ? 'Simpan perubahan' : 'Terbitkan topik') + '</button>' +
+        '<button class="btn" type="button" data-go="' + (topic ? 'forum/' + esc(topic.disc_id) : 'forum') + '">Batal</button></div></form></div>';
+      bindGo(main);
+      var up = topic ? null : App.uploader($('#te-up'), 'forum', 5);
+      $('#te-form').onsubmit = function (e) {
+        e.preventDefault();
+        if (up && up.busy()) { App.toast('Tunggu sampai lampiran selesai diunggah.'); return; }
+        var btn = $('button[type=submit]', this), f = App.formData(this);
+        App.busy(btn, true);
+        var call = topic ? api('forum.update', { discId: topic.disc_id, cat_id: f.cat_id, title: f.title, body: f.body })
+          : api('forum.create', { cat_id: f.cat_id, title: f.title, body: f.body, attachmentIds: up.ids() });
+        call.then(function (res) {
+          App.toast(topic ? 'Topik diperbarui.' : 'Topik diterbitkan.', 'success');
+          App.go('forum/' + (topic ? topic.disc_id : res.disc_id));
+        }).catch(function (err) { App.busy(btn, false); App.showError($('#te-msg'), err); });
+      };
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  function reactionBar(targetType, targetId, summary, types, small) {
+    return '<div class="react-bar' + (small ? ' small' : '') + '" data-rt="' + targetType + '" data-rid="' + esc(targetId) + '">' +
+      Object.keys(types).map(function (k) {
+        var n = summary.counts[k] || 0;
+        return '<button type="button" class="react' + (summary.mine === k ? ' on' : '') + '" data-rx="' + k + '">' + esc(types[k]) +
+          (n ? ' <b>' + n + '</b>' : '') + '</button>';
+      }).join('') + '</div>';
+  }
+
+  function viewTopic(main, discId) {
+    api('forum.get', { discId: discId }).then(function (d) {
+      var t = d.topic, types = d.reaction_types;
+      var replyHtml = function (c, child) {
+        return '<div class="reply' + (child ? ' child' : '') + (c.deleted ? ' deleted' : '') + '" id="c-' + esc(c.comment_id) + '">' +
+          '<div class="reply-head">' + App.avatar(c.author, child ? 28 : 34) + '<div class="meta"><b>' + esc(c.author.full_name) + '</b>' +
+          (c.author.role !== 'member' ? ' <span class="chip chip-blue" style="padding:0 7px">' + esc(c.author.role_label) + '</span>' : '') +
+          '<small>' + esc(App.timeAgo(c.created_at)) + '</small></div></div>' +
+          (c.deleted ? '<p class="deleted-text" style="margin:6px 0 0">Balasan ini telah dihapus.</p>' :
+            '<div class="post-body">' + richText(c.body) + '</div>' + attachmentsHtml(c.attachments) +
+            '<div class="reply-actions">' + reactionBar('comment', c.comment_id, c.reactions, types, true) +
+            (d.can_reply ? '<button type="button" class="link-btn" data-cmt="' + esc(child ? c.parent_id : c.comment_id) + '">' + ic('reply', 14) + ' Komentari</button>' : '') +
+            (c.can_delete ? '<button type="button" class="link-btn danger" data-delc="' + esc(c.comment_id) + '" data-own="' + (c.author.user_id === App.me.user_id ? 1 : 0) + '">' + ic('trash', 14) + ' Hapus</button>' : '') +
+            (c.author.user_id !== App.me.user_id ? '<button type="button" class="link-btn" data-rep="comment" data-rid="' + esc(c.comment_id) + '">Laporkan</button>' : '') +
+            '</div>') +
+          (child ? '' : '<div class="children">' + c.children.map(function (x) { return replyHtml(x, true); }).join('') +
+            '<div class="cmt-form hidden" data-cf="' + esc(c.comment_id) + '"></div></div>') + '</div>';
+      };
+      main.innerHTML = '<div class="main-inner" style="max-width:860px"><a class="small" data-go="forum">' + ic('back', 14) + ' Forum</a>' +
+        '<article class="card card-pad topic-full" style="margin-top:12px">' +
+        '<div class="topic-top">' + (t.is_pinned ? '<span class="chip chip-red">Disematkan</span>' : '') +
+        (t.is_important ? '<span class="chip chip-amber">Penting</span>' : '') + '<span class="chip chip-blue">' + esc(t.cat_name) + '</span>' +
+        (t.is_locked ? '<span class="chip">Dikunci</span>' : '') + '</div>' +
+        '<h1 style="margin:10px 0 14px">' + esc(t.title) + '</h1>' +
+        '<div class="reply-head">' + App.avatar(t.author, 38) + '<div class="meta"><b>' + esc(t.author.full_name) + '</b>' +
+        '<small>' + (t.author.jabatan ? esc(t.author.jabatan) + ' · ' : '') + esc(when(t.created_at)) + (t.updated_at ? ' · diubah' : '') + '</small></div>' +
+        '<div class="topic-actions">' +
+          (t.can_edit ? '<button class="btn btn-sm" data-go="forum/' + esc(t.disc_id) + '/edit">' + ic('pencil', 14) + ' Ubah</button>' +
+            '<button class="btn btn-sm btn-danger" id="tp-del">' + ic('trash', 14) + ' Hapus</button>' : '') +
+          (t.author.user_id !== App.me.user_id ? '<button class="btn btn-sm btn-ghost" data-rep="discussion" data-rid="' + esc(t.disc_id) + '">Laporkan</button>' : '') +
+          '</div></div>' +
+        '<div class="post-body big">' + richText(t.body) + '</div>' + attachmentsHtml(t.attachments) +
+        reactionBar('discussion', t.disc_id, t.reactions, types) +
+        (d.can_moderate ? '<div class="mod-bar"><span class="eyebrow" style="margin:0">Moderasi</span>' +
+          '<label class="check"><input type="checkbox" data-mod="pin"' + (t.is_pinned ? ' checked' : '') + '> Sematkan</label>' +
+          '<label class="check"><input type="checkbox" data-mod="important"' + (t.is_important ? ' checked' : '') + '> Tandai penting</label>' +
+          '<label class="check"><input type="checkbox" data-mod="lock"' + (t.is_locked ? ' checked' : '') + '> Kunci balasan</label></div>' : '') +
+        '</article>' +
+        '<h2 style="margin:22px 0 12px">' + t.reply_count + ' balasan</h2>' +
+        '<div class="replies">' + (d.replies.length ? d.replies.map(function (c) { return '<div class="card card-pad">' + replyHtml(c, false) + '</div>'; }).join('')
+          : '<div class="card"><div class="empty">Belum ada balasan. Jadilah yang pertama menanggapi.</div></div>') + '</div>' +
+        (d.can_reply ? '<form class="card card-pad reply-form" id="rp-form"><h3 style="margin-bottom:10px">Tulis balasan</h3>' +
+          '<textarea class="input" name="body" maxlength="3000" placeholder="Tulis tanggapan Anda…"></textarea><div id="rp-up" style="margin:10px 0"></div>' +
+          '<button class="btn btn-primary" type="submit">' + ic('send', 16) + ' Kirim balasan</button></form>'
+          : '<div class="alert alert-info" style="margin-top:16px">Topik ini dikunci moderator. Balasan baru tidak bisa ditambahkan.</div>') +
+        '</div>';
+      bindGo(main);
+      bindAttachments(main);
+      App.hydrateAvatars(main);
+
+      var reload = function () { viewTopic(main, discId); };
+      // Reaksi: hanya baris reaksi yang diganti, tanpa memuat ulang halaman
+      var bindReact = function (bar) {
+        $$('[data-rx]', bar).forEach(function (b) {
+          b.onclick = function () {
+            b.disabled = true;
+            api('forum.react', { targetType: bar.dataset.rt, targetId: bar.dataset.rid, type: b.dataset.rx }).then(function (s) {
+              var holder = document.createElement('div');
+              holder.innerHTML = reactionBar(bar.dataset.rt, bar.dataset.rid, s, types, bar.classList.contains('small'));
+              var fresh = holder.firstChild;
+              bar.parentNode.replaceChild(fresh, bar);
+              bindReact(fresh);
+            }).catch(function (err) { b.disabled = false; App.toast(err.message, 'error'); });
+          };
+        });
+      };
+      $$('.react-bar', main).forEach(bindReact);
+      // Moderasi
+      $$('[data-mod]', main).forEach(function (cb) {
+        cb.onchange = function () {
+          var p = { discId: discId }; p[cb.dataset.mod] = cb.checked;
+          api('forum.moderate', p).then(function () { App.toast('Topik diperbarui.', 'success'); reload(); })
+            .catch(function (err) { cb.checked = !cb.checked; App.toast(err.message, 'error'); });
+        };
+      });
+      // Laporkan topik / balasan
+      $$('[data-rep]', main).forEach(function (b) {
+        b.onclick = function () { App.report(b.dataset.rep, b.dataset.rid, b.dataset.rep === 'discussion' ? 'topik ini' : 'balasan ini'); };
+      });
+      // Hapus topik
+      var del = $('#tp-del');
+      if (del) del.onclick = function () {
+        var own = t.author.user_id === App.me.user_id;
+        App.modal({ title: 'Hapus topik?', confirm: 'Hapus',
+          body: '<p style="margin-top:0">Topik dan lampirannya akan dihapus dari forum.</p>' +
+            (own ? '' : '<div class="field"><label>Alasan (dikirim ke penulis)</label><textarea class="input" name="reason" maxlength="300" required></textarea></div>'),
+          onConfirm: function (f) {
+            return api('forum.delete', { discId: discId, reason: f.reason || '' }).then(function () { App.toast('Topik dihapus.'); App.go('forum'); });
+          } });
+      };
+      // Hapus balasan
+      $$('[data-delc]', main).forEach(function (b) {
+        b.onclick = function () {
+          var own = b.dataset.own === '1';
+          App.modal({ title: 'Hapus balasan?', confirm: 'Hapus',
+            body: own ? '<p style="margin:0">Balasan Anda akan dihapus.</p>' :
+              '<div class="field"><label>Alasan (dikirim ke penulis)</label><textarea class="input" name="reason" maxlength="300" required></textarea></div>',
+            onConfirm: function (f) { return api('forum.deleteComment', { commentId: b.dataset.delc, reason: f.reason || '' }).then(reload); } });
+        };
+      });
+      // Komentar pada balasan
+      $$('[data-cmt]', main).forEach(function (b) {
+        b.onclick = function () {
+          var box = $('[data-cf="' + b.dataset.cmt + '"]', main);
+          if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+          box.classList.remove('hidden');
+          box.innerHTML = '<form class="cmt-inline"><textarea class="input" name="body" maxlength="3000" placeholder="Tulis komentar…" required></textarea>' +
+            '<button class="btn btn-primary btn-sm" type="submit">Kirim</button></form>';
+          var form = $('form', box);
+          $('textarea', form).focus();
+          form.onsubmit = function (e) {
+            e.preventDefault();
+            var btn = $('button', form);
+            App.busy(btn, true);
+            api('forum.reply', { discId: discId, parentId: b.dataset.cmt, body: App.formData(form).body }).then(reload)
+              .catch(function (err) { App.busy(btn, false); App.toast(err.message, 'error'); });
+          };
+        };
+      });
+      // Balasan utama
+      var rp = $('#rp-form');
+      if (rp) {
+        var up = App.uploader($('#rp-up'), 'forum', 3);
+        rp.onsubmit = function (e) {
+          e.preventDefault();
+          if (up.busy()) { App.toast('Tunggu sampai lampiran selesai diunggah.'); return; }
+          var btn = $('button[type=submit]', rp);
+          App.busy(btn, true);
+          api('forum.reply', { discId: discId, body: App.formData(rp).body, attachmentIds: up.ids() }).then(function (res) {
+            App.toast('Balasan terkirim.', 'success');
+            viewTopic(main, discId);
+            setTimeout(function () { var el = $('#c-' + res.comment.comment_id); if (el) el.scrollIntoView({ block: 'center' }); }, 400);
+          }).catch(function (err) { App.busy(btn, false); App.toast(err.message, 'error'); });
+        };
+      }
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  /* =================== Materi =================== */
+  var rState = { cat: '', kind: '', q: '', status: '' };
+
+  function viewResources(main, r) {
+    rState.status = r.parts[1] === 'pending' ? 'pending' : (r.parts[1] === 'mine' ? 'mine' : '');
+    api('resources.list', rState).then(function (d) {
+      var card = function (x) {
+        var icon = x.kind === 'link' ? '<span class="file-badge link">LINK</span>' : (x.file ? fileBadge(x.file.name, x.file.mime) : '');
+        return '<div class="card res-card">' +
+          '<div style="display:flex;gap:12px;align-items:flex-start">' + icon + '<div style="min-width:0;flex:1"><h2 class="ellipsis">' + esc(x.title) + '</h2>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px"><span class="chip chip-blue">' + esc(x.cat_name) + '</span>' +
+          (!x.approved ? '<span class="chip chip-amber">Menunggu persetujuan</span>' : '') +
+          (x.file ? '<span class="chip">' + esc(App.fmtSize(x.file.size)) + '</span>' : '') + '</div></div></div>' +
+          '<p class="muted res-desc">' + esc(x.description || (x.kind === 'link' ? x.url : x.file ? x.file.name : '')) + '</p>' +
+          '<div class="topic-meta">' + App.avatar(x.uploader, 22) + '<span>' + esc(x.uploader.full_name) + ' · ' + esc(App.timeAgo(x.created_at)) +
+          '</span><span class="sp"></span><span title="Dibuka/diunduh">' + ic('download', 14) + ' ' + x.download_count + '</span></div>' +
+          '<div class="res-actions"><button class="btn btn-sm btn-primary" data-open="' + esc(x.res_id) + '">' +
+          (x.kind === 'link' ? 'Buka tautan' : 'Lihat / unduh') + '</button>' +
+          (!x.approved && d.canReview ? '<button class="btn btn-sm btn-success" data-approve="' + esc(x.res_id) + '">Setujui</button>' +
+            '<button class="btn btn-sm btn-danger" data-reject="' + esc(x.res_id) + '">Tolak</button>' : '') +
+          (x.can_delete && (x.approved || !d.canReview) ? '<button class="btn btn-sm btn-ghost" data-del="' + esc(x.res_id) + '" title="Hapus">' + ic('trash', 15) + '</button>' : '') +
+          (x.approved && x.uploader.user_id !== App.me.user_id ? '<button class="btn btn-sm btn-ghost" data-rep="' + esc(x.res_id) + '">Laporkan</button>' : '') +
+          '</div></div>';
+      };
+      var chips = '<button class="cat-chip' + (!rState.cat ? ' active' : '') + '" data-cat="">Semua</button>' + d.categories.map(function (c) {
+        return '<button class="cat-chip' + (rState.cat === c.cat_id ? ' active' : '') + '" data-cat="' + esc(c.cat_id) + '">' + esc(c.name) + ' <small>' + c.count + '</small></button>';
+      }).join('');
+      main.innerHTML = '<div class="main-inner"><div class="page-head"><div><h1>Materi Pembelajaran</h1><p>Modul, latihan soal, dan tautan belajar dari komunitas.</p></div>' +
+        '<button class="btn btn-primary" id="r-add">+ Tambah materi</button></div>' +
+        '<div class="tabs"><a class="tab' + (!rState.status ? ' active' : '') + '" data-go="resources">Semua materi</a>' +
+        '<a class="tab' + (rState.status === 'mine' ? ' active' : '') + '" data-go="resources/mine">Unggahan saya</a>' +
+        (d.pendingCount ? '<a class="tab' + (rState.status === 'pending' ? ' active' : '') + '" data-go="resources/pending">Menunggu persetujuan <b class="badge" style="margin-left:4px">' + d.pendingCount + '</b></a>' : '') +
+        '</div><div class="cat-chips">' + chips + '</div>' +
+        '<div class="toolbar"><input class="input search" id="r-q" placeholder="Cari materi" value="' + esc(rState.q) + '">' +
+        '<select class="input" id="r-kind"><option value="">Semua jenis</option><option value="file"' + (rState.kind === 'file' ? ' selected' : '') + '>File</option>' +
+        '<option value="link"' + (rState.kind === 'link' ? ' selected' : '') + '>Tautan</option></select></div>' +
+        (d.items.length ? '<div class="res-grid">' + d.items.map(card).join('') + '</div>' : '<div class="card"><div class="empty">' + ic('file', 26) +
+          '<p>' + (rState.status === 'pending' ? 'Tidak ada materi yang menunggu.' : 'Belum ada materi. Bagikan modul atau tautan belajar pertama!') + '</p></div></div>') + '</div>';
+      bindGo(main);
+      App.hydrateAvatars(main);
+      var reload = function () { viewResources(main, r); };
+      $$('[data-cat]', main).forEach(function (b) { b.onclick = function () { rState.cat = b.dataset.cat; reload(); }; });
+      $('#r-kind').onchange = function () { rState.kind = this.value; reload(); };
+      var t = null;
+      $('#r-q').oninput = function () {
+        var v = this.value; clearTimeout(t);
+        t = setTimeout(function () { rState.q = v; reload(); setTimeout(function () { var q = $('#r-q'); q.focus(); q.setSelectionRange(v.length, v.length); }, 50); }, 400);
+      };
+      $('#r-add').onclick = function () { resourceDialog(d.categories, reload); };
+      $$('[data-open]', main).forEach(function (b) {
+        b.onclick = function () {
+          App.busy(b, true);
+          api('resources.open', { resId: b.dataset.open }).then(function (res) {
+            App.busy(b, false);
+            if (res.kind === 'link') window.open(res.url, '_blank', 'noopener');
+            else App.openAttachment(res.file);
+          }).catch(function (err) { App.busy(b, false); App.toast(err.message, 'error'); });
+        };
+      });
+      $$('[data-rep]', main).forEach(function (b) {
+        b.onclick = function () { App.report('resource', b.dataset.rep, 'materi ini'); };
+      });
+      $$('[data-approve]', main).forEach(function (b) {
+        b.onclick = function () {
+          App.busy(b, true);
+          api('resources.review', { resId: b.dataset.approve, approve: true }).then(function () { App.toast('Materi disetujui.', 'success'); reload(); })
+            .catch(function (err) { App.busy(b, false); App.toast(err.message, 'error'); });
+        };
+      });
+      $$('[data-reject]', main).forEach(function (b) {
+        b.onclick = function () {
+          App.modal({ title: 'Tolak materi', confirm: 'Tolak',
+            body: '<div class="field"><label>Alasan (dikirim ke pengunggah)</label><textarea class="input" name="reason" maxlength="300" required></textarea></div>',
+            onConfirm: function (f) { return api('resources.review', { resId: b.dataset.reject, approve: false, reason: f.reason }).then(reload); } });
+        };
+      });
+      $$('[data-del]', main).forEach(function (b) {
+        b.onclick = function () {
+          App.modal({ title: 'Hapus materi?', confirm: 'Hapus', body: '<p style="margin:0">Materi dan filenya akan dihapus.</p>',
+            onConfirm: function () { return api('resources.delete', { resId: b.dataset.del }).then(reload); } });
+        };
+      });
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  function resourceDialog(cats, done) {
+    var up = null;
+    App.modal({
+      title: 'Tambah materi', confirm: 'Simpan',
+      body: '<div class="field"><label>Jenis</label><select class="input" name="kind" id="rd-kind"><option value="file">File (PDF, DOCX, PPTX, XLSX, gambar)</option>' +
+        '<option value="link">Tautan (YouTube, artikel, kamus daring)</option></select></div>' +
+        '<div class="field"><label>Judul</label><input class="input" name="title" maxlength="150" required></div>' +
+        '<div class="field"><label>Kategori</label><select class="input" name="cat_id" required><option value="">Pilih kategori</option>' +
+        cats.map(function (c) { return '<option value="' + esc(c.cat_id) + '">' + esc(c.name) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label>Deskripsi <span class="muted">(opsional)</span></label><textarea class="input" name="description" maxlength="1000"></textarea></div>' +
+        '<div class="field" id="rd-url" style="display:none"><label>Tautan</label><input class="input" name="url" placeholder="https://…"></div>' +
+        '<div id="rd-file"></div>' +
+        (isMod() ? '' : '<p class="muted small" style="margin:8px 0 0">Materi akan tampil setelah disetujui Moderator.</p>'),
+      onConfirm: function (f) {
+        if (f.kind === 'file') {
+          if (up.busy()) return Promise.reject({ message: 'Tunggu sampai file selesai diunggah.' });
+          if (!up.ids().length) return Promise.reject({ message: 'Lampirkan file materi.' });
+        }
+        return api('resources.create', { kind: f.kind, title: f.title, cat_id: f.cat_id, description: f.description, url: f.url,
+          attachmentId: f.kind === 'file' ? up.ids()[0] : '' }).then(function (res) { App.toast(res.message, 'success'); done(); });
+      }
+    });
+    up = App.uploader($('#rd-file'), 'resource', 1);
+    $('#rd-kind').onchange = function () {
+      var link = this.value === 'link';
+      $('#rd-url').style.display = link ? '' : 'none';
+      $('#rd-file').style.display = link ? 'none' : '';
+    };
+  }
+
+  /* =================== Pengumuman =================== */
+  var annAll = false;
+
+  function viewAnnouncements(main) {
+    api('announcements.list', { scope: annAll ? 'all' : '' }).then(function (d) {
+      var prio = { mendesak: 'chip-red', penting: 'chip-amber', normal: '' };
+      var status = { scheduled: '<span class="chip">Terjadwal</span>', expired: '<span class="chip">Kedaluwarsa</span>', active: '' };
+      main.innerHTML = '<div class="main-inner" style="max-width:860px"><div class="page-head"><div><h1>Pengumuman</h1><p>Informasi resmi dari pengurus komunitas.</p></div>' +
+        (d.canManage ? '<button class="btn btn-primary" id="an-new">+ Buat pengumuman</button>' : '') + '</div>' +
+        (d.canManage ? '<label class="check" style="margin-bottom:16px"><input type="checkbox" id="an-all"' + (annAll ? ' checked' : '') +
+          '> Tampilkan juga yang terjadwal & kedaluwarsa</label>' : '') +
+        (d.items.length ? d.items.map(function (a) {
+          return '<article class="card card-pad ann-card prio-' + esc(a.priority) + '">' +
+            '<div class="topic-top">' + (a.is_pinned ? '<span class="chip chip-red">Disematkan</span>' : '') +
+            (a.priority !== 'normal' ? '<span class="chip ' + prio[a.priority] + '">' + esc(a.priority_label) + '</span>' : '') +
+            '<span class="chip">' + esc(a.audience_label) + '</span>' + status[a.status] + '</div>' +
+            '<h2 style="font-size:18px;margin:10px 0 8px">' + esc(a.title) + '</h2><div class="post-body">' + richText(a.body) + '</div>' +
+            '<div class="topic-meta" style="margin-top:14px">' + App.avatar(a.author, 22) + '<span>' + esc(a.author.full_name) + ' · ' + esc(when(a.publish_at)) +
+            (a.expires_at ? ' · berlaku sampai ' + esc(when(a.expires_at)) : '') + '</span><span class="sp"></span>' +
+            (d.canManage ? '<button class="btn btn-sm" data-edit="' + esc(a.ann_id) + '">' + ic('pencil', 14) + ' Ubah</button>' +
+              '<button class="btn btn-sm btn-ghost" data-del="' + esc(a.ann_id) + '" title="Hapus">' + ic('trash', 15) + '</button>' : '') +
+            '</div></article>';
+        }).join('') : '<div class="card"><div class="empty">' + ic('info', 24) + '<p>Belum ada pengumuman.</p></div></div>') + '</div>';
+      App.hydrateAvatars(main);
+      var reload = function () { viewAnnouncements(main); };
+      var all = $('#an-all');
+      if (all) all.onchange = function () { annAll = this.checked; reload(); };
+      var nb = $('#an-new');
+      if (nb) nb.onclick = function () { announcementDialog(null, d.audiences, reload); };
+      $$('[data-edit]', main).forEach(function (b) {
+        b.onclick = function () { announcementDialog(d.items.filter(function (a) { return a.ann_id === b.dataset.edit; })[0], d.audiences, reload); };
+      });
+      $$('[data-del]', main).forEach(function (b) {
+        b.onclick = function () {
+          App.modal({ title: 'Hapus pengumuman?', confirm: 'Hapus', body: '<p style="margin:0">Pengumuman tidak akan tampil lagi.</p>',
+            onConfirm: function () { return api('announcements.delete', { annId: b.dataset.del }).then(reload); } });
+        };
+      });
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  function announcementDialog(a, audiences, done) {
+    var opt = function (v, label, cur) { return '<option value="' + esc(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(label) + '</option>'; };
+    App.modal({
+      title: a ? 'Ubah pengumuman' : 'Buat pengumuman', confirm: a ? 'Simpan' : 'Terbitkan',
+      body: '<div class="field"><label>Judul</label><input class="input" name="title" maxlength="150" required value="' + esc(a ? a.title : '') + '"></div>' +
+        '<div class="field"><label>Isi</label><textarea class="input" name="body" maxlength="5000" style="min-height:140px" required>' + esc(a ? a.body : '') + '</textarea></div>' +
+        '<div class="row"><div class="field"><label>Prioritas</label><select class="input" name="priority">' +
+        opt('normal', 'Normal', a ? a.priority : 'normal') + opt('penting', 'Penting', a ? a.priority : '') + opt('mendesak', 'Mendesak (banner di dashboard)', a ? a.priority : '') +
+        '</select></div><div class="field"><label>Untuk</label><select class="input" name="audience">' +
+        audiences.map(function (x) { return opt(x.value, x.label, a ? a.audience : 'all'); }).join('') + '</select></div></div>' +
+        '<div class="row"><div class="field"><label>Tayang mulai <span class="muted">(kosong = sekarang)</span></label><input class="input" type="datetime-local" name="publish_at" value="' +
+        esc(a ? toLocalInput(a.publish_at) : '') + '"></div><div class="field"><label>Berakhir <span class="muted">(opsional)</span></label><input class="input" type="datetime-local" name="expires_at" value="' +
+        esc(a ? toLocalInput(a.expires_at) : '') + '"></div></div>' +
+        '<label class="check"><input type="checkbox" name="is_pinned"' + (a && a.is_pinned ? ' checked' : '') + '> Sematkan di urutan teratas</label>' +
+        (a ? '' : '<p class="muted small" style="margin:10px 0 0">Semua anggota target menerima notifikasi saat pengumuman tayang.</p>'),
+      onConfirm: function (f) {
+        f.annId = a ? a.ann_id : '';
+        return api('announcements.save', f).then(function (res) { App.toast(res.message, 'success'); done(); });
+      }
+    });
+  }
+
+  /* =================== Agenda =================== */
+  var eScope = 'upcoming';
+
+  function dateBlock(iso) {
+    var d = new Date(iso);
+    return '<div class="date-block"><b>' + d.getDate() + '</b><span>' + d.toLocaleDateString('id-ID', { month: 'short' }) + '</span></div>';
+  }
+
+  function eventStatus(e) {
+    if (e.my_status === 'attended') return '<span class="chip chip-green">Hadir</span>';
+    if (e.my_status === 'registered') return '<span class="chip chip-green">Terdaftar</span>';
+    if (e.is_past) return '<span class="chip">Selesai</span>';
+    if (!e.registration_open) return '<span class="chip">' + (e.quota && e.taken >= e.quota ? 'Kuota penuh' : 'Pendaftaran ditutup') + '</span>';
+    return '';
+  }
+
+  function eventTime(e) {
+    var s = new Date(e.start_at);
+    var t = s.toLocaleString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+    if (e.end_at) t += ' – ' + new Date(e.end_at).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+    return t;
+  }
+
+  function viewEvents(main, r) {
+    if (r.parts[1]) return viewEvent(main, r.parts[1]);
+    api('events.list', { scope: eScope }).then(function (d) {
+      main.innerHTML = '<div class="main-inner" style="max-width:900px"><div class="page-head"><div><h1>Agenda Kegiatan</h1><p>Seminar, workshop, dan kegiatan komunitas.</p></div>' +
+        (d.canManage ? '<button class="btn btn-primary" id="ev-new">+ Buat agenda</button>' : '') + '</div>' +
+        '<div class="tabs"><a class="tab' + (eScope === 'upcoming' ? ' active' : '') + '" data-s="upcoming">Mendatang</a>' +
+        '<a class="tab' + (eScope === 'mine' ? ' active' : '') + '" data-s="mine">Agenda saya</a>' +
+        '<a class="tab' + (eScope === 'past' ? ' active' : '') + '" data-s="past">Selesai</a></div>' +
+        (d.items.length ? '<div class="event-list">' + d.items.map(function (e) {
+          return '<a class="card event-card" data-go="events/' + esc(e.event_id) + '">' + dateBlock(e.start_at) +
+            '<div style="flex:1;min-width:0"><h2>' + esc(e.title) + '</h2><div class="muted small">' + esc(eventTime(e)) + '</div>' +
+            '<div class="muted small">' + esc(e.location) + '</div><div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">' + eventStatus(e) +
+            '<span class="chip">' + e.taken + (e.quota ? '/' + e.quota : '') + ' peserta</span></div></div></a>';
+        }).join('') + '</div>' : '<div class="card"><div class="empty">' + ic('info', 24) + '<p>' +
+          (eScope === 'mine' ? 'Anda belum mendaftar agenda apa pun.' : eScope === 'past' ? 'Belum ada agenda yang selesai.' : 'Belum ada agenda mendatang.') + '</p></div></div>') + '</div>';
+      bindGo(main);
+      $$('[data-s]', main).forEach(function (t) { t.onclick = function () { eScope = t.dataset.s; viewEvents(main, r); }; });
+      var nb = $('#ev-new');
+      if (nb) nb.onclick = function () { eventDialog(null, function (id) { App.go('events/' + id); }); };
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  function viewEvent(main, id) {
+    api('events.get', { eventId: id }).then(function (e) {
+      var action = '';
+      if (!e.is_past && !e.started) {
+        if (e.my_status === 'registered') action = '<button class="btn" id="ev-cancel">Batalkan pendaftaran</button>';
+        else if (e.my_status !== 'attended' && e.registration_open) action = '<button class="btn btn-primary" id="ev-reg">Daftar sekarang</button>';
+      }
+      main.innerHTML = '<div class="main-inner" style="max-width:860px"><a class="small" data-go="events">' + ic('back', 14) + ' Agenda</a>' +
+        '<div class="card card-pad" style="margin-top:12px"><div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">' + dateBlock(e.start_at) +
+        '<div style="flex:1;min-width:220px"><h1 style="margin-bottom:8px">' + esc(e.title) + '</h1><div style="display:flex;gap:6px;flex-wrap:wrap">' + eventStatus(e) +
+        '<span class="chip">' + e.taken + (e.quota ? '/' + e.quota : '') + ' peserta</span></div></div>' +
+        (e.can_manage ? '<div class="topic-actions"><button class="btn btn-sm" id="ev-edit">' + ic('pencil', 14) + ' Ubah</button>' +
+          '<button class="btn btn-sm btn-danger" id="ev-del">' + ic('trash', 14) + ' Hapus</button></div>' : '') + '</div>' +
+        '<dl class="kv" style="margin:20px 0 0"><dt>Waktu</dt><dd>' + esc(eventTime(e)) + '</dd><dt>Lokasi</dt><dd>' + richText(e.location) + '</dd>' +
+        (e.reg_deadline ? '<dt>Batas daftar</dt><dd>' + esc(when(e.reg_deadline)) + '</dd>' : '') +
+        '<dt>Kuota</dt><dd>' + (e.quota ? e.quota + ' orang' : 'Tidak dibatasi') + '</dd></dl>' +
+        (e.description ? '<div class="post-body" style="margin-top:18px">' + richText(e.description) + '</div>' : '') +
+        (action ? '<div style="margin-top:20px">' + action + '</div>' : '') + '</div>' +
+        '<div class="card card-pad" style="margin-top:16px"><h2 style="margin-bottom:12px">Peserta (' + e.participants.length + ')</h2>' +
+        (e.participants.length ? '<div class="pick-list" style="max-height:none;margin:0">' + e.participants.map(function (p) {
+          return '<div class="pick-item static">' + App.avatar(p, 34) + '<span class="meta"><b>' + esc(p.full_name) + '</b><small>Daftar ' +
+            esc(App.timeAgo(p.registered_at)) + '</small></span>' +
+            (e.can_manage ? '<label class="check"><input type="checkbox" data-att="' + esc(p.user_id) + '"' + (p.status === 'attended' ? ' checked' : '') + '> Hadir</label>'
+              : (p.status === 'attended' ? '<span class="chip chip-green">Hadir</span>' : '')) + '</div>';
+        }).join('') + '</div>' : '<div class="empty small">Belum ada peserta.</div>') + '</div></div>';
+      bindGo(main);
+      App.hydrateAvatars(main);
+      var reload = function () { viewEvent(main, id); };
+      var reg = $('#ev-reg');
+      if (reg) reg.onclick = function () {
+        App.busy(reg, true);
+        api('events.register', { eventId: id }).then(function () { App.toast('Anda terdaftar. Pengingat dikirim H-1.', 'success'); reload(); })
+          .catch(function (err) { App.busy(reg, false); App.toast(err.message, 'error'); });
+      };
+      var cancel = $('#ev-cancel');
+      if (cancel) cancel.onclick = function () {
+        App.busy(cancel, true);
+        api('events.cancel', { eventId: id }).then(function () { App.toast('Pendaftaran dibatalkan.'); reload(); })
+          .catch(function (err) { App.busy(cancel, false); App.toast(err.message, 'error'); });
+      };
+      $$('[data-att]', main).forEach(function (cb) {
+        cb.onchange = function () {
+          api('events.attendance', { eventId: id, userId: cb.dataset.att, attended: cb.checked })
+            .then(function () { App.toast(cb.checked ? 'Ditandai hadir.' : 'Tanda hadir dibatalkan.'); })
+            .catch(function (err) { cb.checked = !cb.checked; App.toast(err.message, 'error'); });
+        };
+      });
+      var edit = $('#ev-edit');
+      if (edit) edit.onclick = function () { eventDialog(e, reload); };
+      var del = $('#ev-del');
+      if (del) del.onclick = function () {
+        App.modal({ title: 'Hapus agenda?', confirm: 'Hapus', body: '<p style="margin:0">Peserta terdaftar akan diberi tahu bahwa agenda dibatalkan.</p>',
+          onConfirm: function () { return api('events.delete', { eventId: id }).then(function () { App.toast('Agenda dihapus.'); App.go('events'); }); } });
+      };
+    }).catch(function (err) { errBox(main, err); });
+  }
+
+  function eventDialog(e, done) {
+    App.modal({
+      title: e ? 'Ubah agenda' : 'Buat agenda', confirm: e ? 'Simpan' : 'Buat & umumkan',
+      body: '<div class="field"><label>Judul</label><input class="input" name="title" maxlength="150" required value="' + esc(e ? e.title : '') + '"></div>' +
+        '<div class="field"><label>Lokasi</label><input class="input" name="location" maxlength="200" required placeholder="mis. Aula Lt. 2 atau tautan Zoom" value="' + esc(e ? e.location : '') + '"></div>' +
+        '<div class="row"><div class="field"><label>Mulai</label><input class="input" type="datetime-local" name="start_at" required value="' + esc(e ? toLocalInput(e.start_at) : '') + '"></div>' +
+        '<div class="field"><label>Selesai <span class="muted">(opsional)</span></label><input class="input" type="datetime-local" name="end_at" value="' + esc(e ? toLocalInput(e.end_at) : '') + '"></div></div>' +
+        '<div class="row"><div class="field"><label>Batas pendaftaran <span class="muted">(opsional)</span></label><input class="input" type="datetime-local" name="reg_deadline" value="' +
+        esc(e ? toLocalInput(e.reg_deadline) : '') + '"></div><div class="field"><label>Kuota <span class="muted">(0 = tanpa batas)</span></label><input class="input" type="number" min="0" name="quota" value="' +
+        (e ? e.quota : 0) + '"></div></div>' +
+        '<div class="field"><label>Deskripsi</label><textarea class="input" name="description" maxlength="3000">' + esc(e ? e.description : '') + '</textarea></div>' +
+        (e ? '<p class="muted small" style="margin:0">Peserta diberi tahu bila waktu atau lokasi berubah.</p>' : '<p class="muted small" style="margin:0">Semua anggota menerima notifikasi agenda baru.</p>'),
+      onConfirm: function (f) {
+        f.eventId = e ? e.event_id : '';
+        return api('events.save', f).then(function (res) { App.toast(res.message, 'success'); done(res.event_id); });
+      }
+    });
+  }
+
+  App.routes.forum = { title: 'Forum Diskusi', view: viewForum };
+  App.routes.resources = { title: 'Materi Pembelajaran', view: viewResources };
+  App.routes.announcements = { title: 'Pengumuman', view: viewAnnouncements };
+  App.routes.events = { title: 'Agenda Kegiatan', view: viewEvents };
+})();
+</script>

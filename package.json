@@ -1,0 +1,17 @@
+{
+  "name": "yapp-gas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "YAPP — Let's Yapp for better English. Web app komunitas Jurusan Bahasa Inggris berbasis Google Apps Script.",
+  "scripts": {
+    "login": "clasp login",
+    "clone": "clasp clone $SCRIPT_ID",
+    "push": "clasp push",
+    "deploy": "clasp deploy",
+    "open": "clasp open-web-app",
+    "logs": "clasp logs --watch"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.4.2"
+  }
+}

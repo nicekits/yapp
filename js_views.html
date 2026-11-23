@@ -1,0 +1,791 @@
+<script>
+/* js_views — semua halaman. Setiap data dari pengguna ditampilkan lewat esc() untuk mencegah XSS. */
+(function () {
+  var V = App.views;
+  var api = App.api, $ = App.$, $$ = App.$$;
+
+  var errorBox = function (err, retry) {
+    return '<div class="card card-pad"><div class="alert alert-error" style="margin:0 0 12px">' +
+      esc((err && err.message) || 'Gagal memuat data.') + '</div>' +
+      (retry ? '<button class="btn" id="btn-retry"><i class="bi bi-arrow-clockwise"></i> Coba lagi</button>' : '') + '</div>';
+  };
+  var showErr = function (main, err) {
+    main.innerHTML = '<div class="main-inner">' + errorBox(err, true) + '</div>';
+    var b = $('#btn-retry', main);
+    if (b) b.onclick = function () { App.render(App.path, true); };
+  };
+  var roleChip = function (role, label) {
+    var cls = { super_admin: 'chip-red', admin: 'chip-amber', moderator: 'chip-blue', member: '' }[role] || '';
+    return '<span class="chip ' + cls + '">' + esc(label || role) + '</span>';
+  };
+  var statusChip = function (s) {
+    var map = { pending: ['chip-amber', 'Pending'], approved: ['chip-green', 'Approved'],
+      rejected: ['chip-red', 'Rejected'], suspended: ['', 'Suspended'] };
+    var m = map[s] || ['', s];
+    return '<span class="chip ' + m[0] + '">' + m[1] + '</span>';
+  };
+  var empty = function (icon, text) {
+    return '<div class="empty"><i class="bi ' + icon + '"></i>' + esc(text) + '</div>';
+  };
+  var yearOptions = function (selected) {
+    var y = new Date().getFullYear() + 1, out = '<option value="">Pilih angkatan</option>';
+    for (var i = y; i >= y - 10; i--) out += '<option' + (String(i) === String(selected) ? ' selected' : '') + '>' + i + '</option>';
+    return out;
+  };
+
+  /* =================== Halaman publik =================== */
+  var brand = function () {
+    return '<div class="auth-brand">' + App.logo(58) + '<div class="wordmark">' + esc(App.boot.appName || 'YAPP') + '</div>' +
+      '<div class="tagline">' + esc(App.boot.tagline || '') + '</div></div>';
+  };
+  var wrap = function (inner, wide) {
+    return '<div class="auth-wrap"><div class="auth-card' + (wide ? ' wide' : '') + '">' + brand() + inner + '</div></div>';
+  };
+
+  V.public_login = function () {
+    return wrap(
+      (App.boot.infoBanner ? '<div class="alert alert-warning">' + esc(App.boot.infoBanner) + '</div>' : '') +
+      '<h1>Masuk</h1><p class="lead">Khusus anggota yang sudah disetujui admin.</p>' +
+      '<div class="alert hidden" id="msg"></div>' +
+      '<form id="f-login" autocomplete="on">' +
+      '<div class="field"><label for="identifier">Email atau username</label>' +
+      '<input class="input" id="identifier" name="identifier" autocomplete="username" required></div>' +
+      '<div class="field"><label for="password">Password</label>' +
+      '<input class="input" id="password" name="password" type="password" autocomplete="current-password" required></div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">' +
+      '<label class="check"><input type="checkbox" name="remember"> Ingat saya 7 hari</label>' +
+      '<a data-go="forgot">Lupa password?</a></div>' +
+      '<button class="btn btn-primary btn-block" type="submit">Masuk</button></form>' +
+      (App.boot.registrationOpen === false ? '<div class="auth-foot">Pendaftaran anggota baru sedang ditutup.</div>'
+        : '<div class="auth-foot">Belum punya akun? <a data-go="register">Daftar sebagai anggota</a></div>'));
+  };
+  V.bind_login = function () {
+    bindGo();
+    $('#f-login').onsubmit = function (e) {
+      e.preventDefault();
+      var btn = $('button[type=submit]', this), d = App.formData(this);
+      d.userAgent = navigator.userAgent;
+      App.busy(btn, true);
+      api('auth.login', d).then(function (res) {
+        if (res.status === 'approved') {
+          App.startSession(res.token, res.me, d.remember);
+          App.go('dashboard');
+          if (res.singleDeviceNotice) {
+            App.toast('Anda keluar otomatis dari perangkat lain karena 1 akun hanya bisa aktif di 1 perangkat.', 'info');
+          }
+        } else {
+          App.statusInfo = res;
+          App.go('status');
+        }
+      }).catch(function (err) { App.busy(btn, false); App.showError($('#msg'), err); });
+    };
+  };
+
+  V.public_register = function () {
+    if (App.boot.registrationOpen === false) {
+      return wrap('<h1>Pendaftaran ditutup</h1><p class="lead">Pendaftaran anggota baru sedang ditutup oleh pengurus. Silakan coba lagi nanti.</p>' +
+        '<a class="btn btn-block" data-go="login">Ke halaman masuk</a>');
+    }
+    return wrap(
+      '<h1>Daftar anggota</h1><p class="lead">Akun baru akan diperiksa admin sebelum bisa dipakai.</p>' +
+      '<div class="alert hidden" id="msg"></div>' +
+      '<form id="f-reg" autocomplete="on">' +
+      '<div class="field"><label>Nama lengkap</label><input class="input" name="full_name" maxlength="80" required></div>' +
+      '<div class="row"><div class="field"><label>Username</label><input class="input" name="username" maxlength="20" pattern="[a-z0-9_.]{3,20}" required>' +
+      '<span class="hint">3–20 huruf kecil/angka/titik/_</span></div>' +
+      '<div class="field"><label>Email</label><input class="input" type="email" name="email" autocomplete="email" required></div></div>' +
+      '<div class="row"><div class="field"><label>NIM</label><input class="input" name="nim" maxlength="30" required></div>' +
+      '<div class="field"><label>Angkatan</label><select class="input" name="angkatan" required>' + yearOptions('') + '</select></div></div>' +
+      '<div class="row"><div class="field"><label>Kelas</label><input class="input" name="kelas" maxlength="30" placeholder="mis. A" required></div>' +
+      '<div class="field"><label>No. HP <span class="muted">(opsional)</span></label><input class="input" name="phone" maxlength="20" inputmode="tel"></div></div>' +
+      '<div class="row"><div class="field"><label>Password</label><input class="input" type="password" name="password" autocomplete="new-password" required>' +
+      '<span class="hint">Min. 8 karakter, huruf dan angka</span></div>' +
+      '<div class="field"><label>Ulangi password</label><input class="input" type="password" name="password2" autocomplete="new-password" required></div></div>' +
+      '<label class="check" style="margin-bottom:16px"><input type="checkbox" name="agree" required> Data yang saya isi benar dan saya mematuhi aturan komunitas.</label>' +
+      '<button class="btn btn-primary btn-block" type="submit">Kirim pendaftaran</button></form>' +
+      '<div class="auth-foot">Sudah punya akun? <a data-go="login">Masuk</a></div>', true);
+  };
+  V.bind_register = function () {
+    bindGo();
+    if (!$('#f-reg')) return;
+    $('#f-reg').onsubmit = function (e) {
+      e.preventDefault();
+      var form = this, btn = $('button[type=submit]', form), d = App.formData(form);
+      d.username = String(d.username || '').toLowerCase();
+      d.deviceId = App.deviceId();
+      App.busy(btn, true);
+      api('auth.register', d).then(function (res) {
+        App.statusInfo = { status: 'pending', name: d.full_name, justRegistered: true, message: res.message };
+        App.go('status');
+      }).catch(function (err) {
+        App.busy(btn, false);
+        App.showError($('#msg'), err);
+        $('#msg').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    };
+  };
+
+  V.public_status = function () {
+    var s = App.statusInfo;
+    if (!s) return wrap('<h1>Status pendaftaran</h1><p class="lead">Masuk dengan email dan password Anda untuk melihat status pendaftaran.</p>' +
+      '<a class="btn btn-primary btn-block" data-go="login">Ke halaman masuk</a>');
+    var cfg = {
+      pending: ['bi-hourglass-split', 'var(--warning-soft)', 'var(--warning)', 'Menunggu persetujuan',
+        s.justRegistered ? 'Pendaftaran Anda sudah kami terima. Admin akan memeriksa data Anda (termasuk NIM).'
+          : 'Pendaftaran Anda sedang diperiksa admin.'],
+      rejected: ['bi-x-circle', 'var(--danger-soft)', 'var(--danger)', 'Pendaftaran ditolak',
+        'Pendaftaran Anda tidak disetujui admin.'],
+      suspended: ['bi-slash-circle', 'rgba(127,127,140,.12)', 'var(--text-2)', 'Akun dinonaktifkan',
+        'Akun Anda sedang dinonaktifkan sementara oleh admin.']
+    }[s.status];
+    var extra = '';
+    if (s.status === 'pending') extra = '<div class="alert alert-info">Tidak ada email pemberitahuan. Masuk lagi nanti untuk mengecek status; setelah disetujui Anda langsung masuk ke aplikasi.</div>';
+    if (s.reason) extra += '<div class="alert alert-warning"><b>Alasan:</b> ' + esc(s.reason) + '</div>';
+    if (s.status === 'rejected' && s.reapply_at) {
+      extra += '<p class="muted">Anda bisa mendaftar ulang mulai ' + esc(App.fmtDate(s.reapply_at, true)) + '.</p>';
+    }
+    if (s.status === 'suspended') extra += '<p class="muted">Hubungi pengurus komunitas untuk informasi lebih lanjut.</p>';
+    return wrap('<div class="status-icon" style="background:' + cfg[1] + ';color:' + cfg[2] + '"><i class="bi ' + cfg[0] + '"></i></div>' +
+      '<h1>' + cfg[3] + '</h1><p class="lead">Halo, ' + esc(s.name || '') + '. ' + cfg[4] + '</p>' + extra +
+      '<a class="btn btn-block" data-go="login">Kembali ke halaman masuk</a>');
+  };
+  V.bind_status = function () { bindGo(); };
+
+  V.public_forgot = function () {
+    return wrap('<h1>Lupa password</h1><p class="lead">Masukkan email akun Anda. Kami kirim tautan untuk membuat password baru.</p>' +
+      '<div class="alert hidden" id="msg"></div>' +
+      '<form id="f-forgot"><div class="field"><label>Email</label><input class="input" type="email" name="email" required></div>' +
+      '<button class="btn btn-primary btn-block" type="submit">Kirim tautan reset</button></form>' +
+      '<div class="auth-foot"><a data-go="login">Kembali ke halaman masuk</a></div>');
+  };
+  V.bind_forgot = function () {
+    bindGo();
+    $('#f-forgot').onsubmit = function (e) {
+      e.preventDefault();
+      var btn = $('button[type=submit]', this);
+      App.busy(btn, true);
+      api('auth.forgot', App.formData(this)).then(function (res) {
+        var m = $('#msg'); m.className = 'alert alert-success'; m.textContent = res.message;
+        $('#f-forgot').classList.add('hidden');
+      }).catch(function (err) { App.busy(btn, false); App.showError($('#msg'), err); });
+    };
+  };
+
+  V.public_reset = function () {
+    return wrap('<h1>Buat password baru</h1><p class="lead">Setelah diganti, semua perangkat yang sedang login akan dikeluarkan.</p>' +
+      '<div class="alert hidden" id="msg"></div>' +
+      '<form id="f-reset"><div class="field"><label>Password baru</label><input class="input" type="password" name="password" autocomplete="new-password" required>' +
+      '<span class="hint">Min. 8 karakter, huruf dan angka</span></div>' +
+      '<div class="field"><label>Ulangi password baru</label><input class="input" type="password" name="password2" autocomplete="new-password" required></div>' +
+      '<button class="btn btn-primary btn-block" type="submit">Simpan password</button></form>' +
+      '<div class="auth-foot"><a data-go="login">Ke halaman masuk</a></div>');
+  };
+  V.bind_reset = function () {
+    bindGo();
+    $('#f-reset').onsubmit = function (e) {
+      e.preventDefault();
+      var btn = $('button[type=submit]', this), d = App.formData(this);
+      d.token = App.boot.resetToken;
+      App.busy(btn, true);
+      api('auth.reset', d).then(function (res) {
+        App.boot.page = ''; App.boot.resetToken = '';
+        var m = $('#msg'); m.className = 'alert alert-success'; m.textContent = res.message;
+        $('#f-reset').classList.add('hidden');
+      }).catch(function (err) { App.busy(btn, false); App.showError($('#msg'), err); });
+    };
+  };
+
+  function bindGo(root) {
+    $$('[data-go]', root).forEach(function (a) {
+      a.onclick = function (e) { e.preventDefault(); App.go(a.dataset.go); };
+    });
+  }
+
+  /* =================== Dashboard =================== */
+  function viewDashboard(main) {
+    api('dashboard.summary').then(function (d) {
+      var isAdmin = App.isAdmin();
+      var today = new Date().toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+      var stat = function (icon, value, label, go, accent) {
+        return '<div class="card stat' + (accent ? ' accent' : '') + (go ? ' clickable" data-go="' + go : '') + '"><div class="stat-icon"><i class="bi ' + icon +
+          '"></i></div><div><div class="stat-value">' + esc(value) + '</div><div class="stat-label">' + esc(label) + '</div></div></div>';
+      };
+      var maxA = Math.max.apply(null, d.byAngkatan.map(function (x) { return x.count; }).concat([1]));
+      main.innerHTML = '<div class="main-inner">' +
+        '<div class="page-head"><div><div class="eyebrow">' + esc(today) + '</div><h1>Halo, ' + esc(d.greetingName.split(' ')[0]) +
+        '</h1><p>' + esc(App.boot.tagline || '') + '</p></div></div>' +
+        (d.info_banner ? '<div class="alert alert-warning" style="margin-bottom:14px">' + esc(d.info_banner) + '</div>' : '') +
+        d.urgent.map(function (a) {
+          return '<div class="urgent-banner" data-go="announcements"><span class="ub-tag">Mendesak</span><div><b>' + esc(a.title) + '</b>' +
+            '<div class="small">' + esc(a.body.length > 140 ? a.body.slice(0, 137) + '…' : a.body) + '</div></div></div>';
+        }).join('') +
+        '<div class="grid grid-4" style="margin-bottom:14px">' +
+        stat('bi-people', d.stats.members, 'Anggota aktif', 'members', true) +
+        stat('bi-broadcast', d.stats.online, 'Sedang online', 'members') +
+        stat('bi-mortarboard', d.stats.angkatan, 'Angkatan', 'members') +
+        (isAdmin ? stat('bi-person-check', d.stats.pending || 0, 'Menunggu persetujuan', 'admin')
+          : stat('bi-chat-dots', d.stats.unread || 0, 'Pesan belum dibaca', 'chat')) +
+        '</div>' +
+        '<div class="grid grid-2" style="margin-bottom:14px">' +
+        '<div class="card"><div class="card-head"><h2><i class="bi bi-megaphone"></i> Pengumuman</h2><a data-go="announcements" class="small">Semua</a></div><div class="card-body">' +
+        (d.announcements.length ? d.announcements.map(function (a) {
+          return '<div class="list-item" style="cursor:pointer" data-go="announcements"><div class="meta"><div class="name">' + esc(a.title) + '</div>' +
+            '<div class="muted small">' + esc(App.timeAgo(a.publish_at)) + ' · ' + esc(a.audience_label) + '</div></div>' +
+            (a.priority !== 'normal' ? '<span class="chip ' + (a.priority === 'mendesak' ? 'chip-red' : 'chip-amber') + '">' + esc(a.priority_label) + '</span>' : '') + '</div>';
+        }).join('') : empty('bi-megaphone', 'Belum ada pengumuman.')) + '</div></div>' +
+        '<div class="card"><div class="card-head"><h2><i class="bi bi-calendar-event"></i> Agenda mendatang</h2><a data-go="events" class="small">Semua</a></div><div class="card-body">' +
+        (d.events.length ? d.events.map(function (e) {
+          var dt = new Date(e.start_at);
+          return '<div class="list-item" style="cursor:pointer" data-go="events/' + esc(e.event_id) + '"><div class="date-block sm"><b>' + dt.getDate() + '</b><span>' +
+            esc(dt.toLocaleDateString('id-ID', { month: 'short' })) + '</span></div><div class="meta"><div class="name">' + esc(e.title) + '</div><div class="muted small">' +
+            esc(dt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })) + ' · ' + esc(e.location) + '</div></div>' +
+            (e.my_status === 'registered' ? '<span class="chip chip-green">Terdaftar</span>' : '') + '</div>';
+        }).join('') : empty('bi-calendar3', 'Belum ada agenda mendatang.')) + '</div></div></div>' +
+        '<div class="card" style="margin-bottom:14px"><div class="card-head"><h2><i class="bi bi-chat-dots"></i> Pesan terbaru</h2><a data-go="chat" class="small">Buka chat</a></div><div class="card-body">' +
+        (d.recentConversations.length ? d.recentConversations.map(function (c) {
+          return '<div class="list-item" style="cursor:pointer" data-conv="' + esc(c.conv_id) + '">' +
+            App.avatar({ full_name: c.name, photo_file_id: c.photo_file_id, online: c.online }, 38, c.type === 'direct', c.type === 'group') +
+            '<div class="meta"><div class="name">' + esc(c.name) + '</div><div class="muted small" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+            esc(c.preview) + '</div></div><div style="text-align:right"><div class="muted small">' + esc(App.timeAgo(c.last_message_at)) + '</div>' +
+            (c.unread ? '<b class="badge" style="margin-top:4px">' + c.unread + '</b>' : '') + '</div></div>';
+        }).join('') : empty('bi-chat-dots', 'Belum ada percakapan. Mulai chat dari halaman Anggota atau gabung ke grup.')) + '</div></div>' +
+        '<div class="card" style="margin-bottom:14px"><div class="card-head"><h2><i class="bi bi-chat-square-text"></i> Diskusi terbaru di forum</h2><a data-go="forum" class="small">Buka forum</a></div><div class="card-body">' +
+        (d.recentActivity.length ? d.recentActivity.map(function (t) {
+          return '<div class="list-item" style="cursor:pointer" data-go="forum/' + esc(t.disc_id) + '">' + App.avatar(t.author, 34) +
+            '<div class="meta"><div class="name">' + esc(t.title) + '</div><div class="muted small">' + esc(t.author.full_name) + ' · ' + esc(t.cat_name) +
+            ' · ' + t.reply_count + ' balasan</div></div><span class="muted small">' + esc(App.timeAgo(t.last_activity_at)) + '</span></div>';
+        }).join('') : empty('bi-chat-square-text', 'Belum ada diskusi. Mulai topik pertama di forum!')) + '</div></div>' +
+        '<div class="grid grid-2">' +
+        '<div class="card"><div class="card-head"><h2><i class="bi bi-person-plus"></i> Anggota baru</h2><a data-go="members" class="small">Lihat semua</a></div><div class="card-body">' +
+        (d.newestMembers.length ? d.newestMembers.map(function (m) {
+          return '<div class="list-item" style="cursor:pointer" data-member="' + esc(m.user_id) + '">' + App.avatar(m, 36) +
+            '<div class="meta"><div class="name">' + esc(m.full_name) + '</div><div class="muted small">Angkatan ' + esc(m.angkatan) +
+            ' · Kelas ' + esc(m.kelas) + '</div></div><span class="muted small">' + esc(App.timeAgo(m.joined_at)) + '</span></div>';
+        }).join('') : empty('bi-people', 'Belum ada anggota.')) + '</div></div>' +
+        '<div class="card"><div class="card-head"><h2><i class="bi bi-bar-chart"></i> Anggota per angkatan</h2></div><div class="card-body">' +
+        (d.byAngkatan.length ? d.byAngkatan.map(function (a) {
+          return '<div class="bar-row"><span style="width:44px" class="small muted">' + esc(a.angkatan) +
+            '</span><div class="bar-track"><div class="bar-fill" style="width:' + Math.round(a.count / maxA * 100) + '%"></div></div>' +
+            '<b class="small" style="width:24px;text-align:right">' + a.count + '</b></div>';
+        }).join('') : empty('bi-bar-chart', 'Belum ada data.')) + '</div></div>' +
+        '</div></div>';
+      bindGo(main);
+      $$('[data-member]', main).forEach(function (el) { el.onclick = function () { App.go('members/' + el.dataset.member); }; });
+      $$('[data-conv]', main).forEach(function (el) { el.onclick = function () { App.go('chat/' + el.dataset.conv); }; });
+      App.renderOnline({ total: d.stats.online, items: d.online });
+      if (isAdmin) App.setPendingBadge(d.stats.pending || 0);
+      App.hydrateAvatars(main);
+    }).catch(function (err) { showErr(main, err); });
+  }
+
+  /* =================== Direktori anggota =================== */
+  var mState = { q: '', angkatan: '', kelas: '', onlineOnly: false, page: 1 };
+  var mTimer = null;
+
+  function viewMembers(main) {
+    main.innerHTML = '<div class="main-inner"><div class="page-head"><div><h1>Anggota</h1><p id="m-total">Memuat…</p></div></div>' +
+      '<div class="toolbar"><input class="input search" id="m-q" placeholder="Cari nama, username, NIM, atau jabatan" value="' + esc(mState.q) + '">' +
+      '<select class="input" id="m-angkatan"><option value="">Semua angkatan</option></select>' +
+      '<select class="input" id="m-kelas"><option value="">Semua kelas</option></select>' +
+      '<label class="check"><input type="checkbox" id="m-online"' + (mState.onlineOnly ? ' checked' : '') + '> Online saja</label></div>' +
+      '<div id="m-grid"></div><div class="pager" id="m-pager"></div></div>';
+    $('#m-q').oninput = function () {
+      clearTimeout(mTimer);
+      var v = this.value;
+      mTimer = setTimeout(function () { mState.q = v; mState.page = 1; loadMembers(); }, 350);
+    };
+    $('#m-angkatan').onchange = function () { mState.angkatan = this.value; mState.page = 1; loadMembers(); };
+    $('#m-kelas').onchange = function () { mState.kelas = this.value; mState.page = 1; loadMembers(); };
+    $('#m-online').onchange = function () { mState.onlineOnly = this.checked; mState.page = 1; loadMembers(); };
+    loadMembers();
+  }
+
+  function loadMembers() {
+    var grid = $('#m-grid');
+    if (!grid) return;
+    grid.innerHTML = '<div class="member-grid">' + new Array(8).join('<div class="skeleton" style="height:170px"></div>') + '</div>';
+    api('members.list', mState).then(function (d) {
+      if (!$('#m-grid')) return;
+      var fill = function (sel, values, current) {
+        var el = $(sel), first = el.options[0].outerHTML;
+        el.innerHTML = first + values.map(function (v) {
+          return '<option' + (v === current ? ' selected' : '') + '>' + esc(v) + '</option>';
+        }).join('');
+      };
+      fill('#m-angkatan', d.filters.angkatan, mState.angkatan);
+      fill('#m-kelas', d.filters.kelas, mState.kelas);
+      $('#m-total').textContent = d.total + ' anggota ditemukan';
+      grid.innerHTML = d.items.length ? '<div class="member-grid">' + d.items.map(function (m) {
+        return '<div class="card member-card" data-member="' + esc(m.user_id) + '">' + App.avatar(m, 64, true) +
+          '<div class="name">' + esc(m.full_name) + '</div>' +
+          '<div class="muted small">@' + esc(m.username) + (m.nim ? ' · ' + esc(m.nim) : '') + '</div>' +
+          '<div class="muted small">Angkatan ' + esc(m.angkatan) + ' · Kelas ' + esc(m.kelas) + '</div>' +
+          '<div style="margin-top:6px">' + (m.role !== 'member' ? roleChip(m.role, m.role_label) : '<span class="chip">' + esc(m.jabatan || 'Anggota') + '</span>') + '</div></div>';
+      }).join('') + '</div>' : '<div class="card">' + empty('bi-search', 'Tidak ada anggota yang cocok.') + '</div>';
+      $$('[data-member]', grid).forEach(function (el) { el.onclick = function () { App.go('members/' + el.dataset.member); }; });
+      var pages = Math.ceil(d.total / d.pageSize);
+      $('#m-pager').innerHTML = pages > 1 ? '<button class="btn btn-sm" id="pg-prev"' + (d.page <= 1 ? ' disabled' : '') + '>Sebelumnya</button>' +
+        '<span class="muted small">Hal. ' + d.page + ' dari ' + pages + '</span>' +
+        '<button class="btn btn-sm" id="pg-next"' + (d.page >= pages ? ' disabled' : '') + '>Berikutnya</button>' : '';
+      if (pages > 1) {
+        $('#pg-prev').onclick = function () { mState.page--; loadMembers(); };
+        $('#pg-next').onclick = function () { mState.page++; loadMembers(); };
+      }
+      App.hydrateAvatars(grid);
+    }).catch(function (err) { grid.innerHTML = errorBox(err); });
+  }
+
+  function viewMember(main, userId) {
+    api('members.get', { userId: userId }).then(function (m) {
+      var isMe = m.user_id === App.me.user_id;
+      var row = function (k, v) { return v ? '<dt>' + k + '</dt><dd>' + esc(v) + '</dd>' : ''; };
+      main.innerHTML = '<div class="main-inner" style="max-width:720px">' +
+        '<a data-go="members" class="small"><i class="bi bi-arrow-left"></i> Kembali ke daftar anggota</a>' +
+        '<div class="card card-pad" style="margin-top:12px"><div class="profile-hero">' + App.avatar(m, 96, true) +
+        '<div style="flex:1"><h1>' + esc(m.full_name) + '</h1><div class="muted">@' + esc(m.username) + '</div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">' + roleChip(m.role, m.role_label) +
+        (m.jabatan ? '<span class="chip">' + esc(m.jabatan) + '</span>' : '') +
+        (m.online ? '<span class="chip chip-green">Online</span>' : '<span class="chip">Terakhir aktif ' + esc(App.timeAgo(m.last_seen_at)) + '</span>') +
+        (m.status && m.status !== 'approved' ? statusChip(m.status) : '') + '</div></div>' +
+        (isMe ? '<a class="btn" data-go="profile"><i class="bi bi-pencil"></i> Edit profil</a>'
+          : (m.status && m.status !== 'approved' ? '' : (m.allow_dm === false
+            ? '<button class="btn" disabled title="Anggota ini tidak menerima pesan pribadi baru">Tidak menerima pesan</button>'
+            : '<button class="btn btn-primary" id="btn-dm"><i class="bi bi-chat-dots"></i> Kirim pesan</button>') +
+            '<button class="btn btn-ghost btn-sm" id="btn-report-user" title="Laporkan">Laporkan</button>')) +
+        '</div>' + (m.bio ? '<p style="margin:18px 0 0">' + esc(m.bio) + '</p>' : '') + '</div>' +
+        '<div class="card card-pad" style="margin-top:16px"><h2 style="margin-bottom:12px">Informasi</h2><dl class="kv" style="margin:0">' +
+        row('NIM', m.nim) + row('Angkatan', m.angkatan) + row('Kelas', m.kelas) + row('Email', m.email) +
+        row('No. HP', m.phone) + row('Bergabung', App.fmtDate(m.joined_at)) + '</dl></div></div>';
+      bindGo(main);
+      var dm = $('#btn-dm', main);
+      if (dm) dm.onclick = function () { App.openDirect(m.user_id, dm); };
+      var rep = $('#btn-report-user', main);
+      if (rep) rep.onclick = function () { App.report('user', m.user_id, 'anggota ' + m.full_name); };
+      App.hydrateAvatars(main);
+    }).catch(function (err) { showErr(main, err); });
+  }
+
+  /* =================== Profil saya =================== */
+  function viewProfile(main) {
+    api('auth.me').then(function (me) {
+      App.me = me;
+      var ro = function (label, v) {
+        return '<div class="field"><label>' + label + '</label><input class="input" value="' + esc(v || '-') + '" readonly></div>';
+      };
+      main.innerHTML = '<div class="main-inner" style="max-width:720px">' +
+        '<div class="page-head"><div><h1>Profil saya</h1><p>Perubahan NIM, angkatan, dan jabatan dilakukan oleh admin.</p></div>' +
+        '<a class="btn" data-go="members/' + esc(me.user_id) + '"><i class="bi bi-eye"></i> Lihat seperti orang lain</a></div>' +
+        '<div class="card card-pad" style="margin-bottom:16px"><div class="profile-hero" id="photo-box">' + App.avatar(me, 88) +
+        '<div><h2>' + esc(me.full_name) + '</h2><div class="muted small" style="margin-bottom:10px">JPG/PNG/WEBP, otomatis diperkecil.</div>' +
+        '<input type="file" id="photo-input" accept="image/jpeg,image/png,image/webp" class="hidden">' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm" id="btn-photo"><i class="bi bi-camera"></i> Ganti foto</button>' +
+        (me.photo_file_id ? '<button class="btn btn-sm btn-danger" id="btn-photo-del"><i class="bi bi-trash"></i> Hapus foto</button>' : '') +
+        '</div></div></div></div>' +
+        '<form class="card card-pad" id="f-profile"><div class="alert hidden" id="msg"></div>' +
+        '<div class="field"><label>Nama lengkap</label><input class="input" name="full_name" maxlength="80" value="' + esc(me.full_name) + '" required></div>' +
+        '<div class="row"><div class="field"><label>Kelas</label><input class="input" name="kelas" maxlength="30" value="' + esc(me.kelas) + '" required></div>' +
+        '<div class="field"><label>No. HP</label><input class="input" name="phone" maxlength="20" value="' + esc(me.phone) + '"></div></div>' +
+        '<div class="field"><label>Bio singkat</label><textarea class="input" name="bio" maxlength="300" placeholder="Ceritakan sedikit tentang Anda">' + esc(me.bio) + '</textarea></div>' +
+        '<div class="row">' + ro('Username', '@' + me.username) + ro('Email', me.email) + '</div>' +
+        '<div class="row">' + ro('NIM', me.nim) + ro('Angkatan', me.angkatan) + '</div>' +
+        '<div class="row">' + ro('Jabatan', me.jabatan) + ro('Role', me.role_label) + '</div>' +
+        '<button class="btn btn-primary" type="submit">Simpan perubahan</button></form></div>';
+      bindGo(main);
+      App.hydrateAvatars(main);
+
+      $('#f-profile').onsubmit = function (e) {
+        e.preventDefault();
+        var btn = $('button[type=submit]', this), d = App.formData(this);
+        App.busy(btn, true);
+        api('profile.update', { full_name: d.full_name, kelas: d.kelas, phone: d.phone, bio: d.bio }).then(function (me2) {
+          App.me = me2; App.updateMeChip(); App.busy(btn, false);
+          App.toast('Profil disimpan.', 'success');
+        }).catch(function (err) { App.busy(btn, false); App.showError($('#msg'), err); });
+      };
+      $('#btn-photo').onclick = function () { $('#photo-input').click(); };
+      $('#photo-input').onchange = function () {
+        var file = this.files[0];
+        if (!file) return;
+        var btn = $('#btn-photo');
+        App.busy(btn, true);
+        resizeImage(file, 256).then(function (dataUrl) {
+          return api('profile.uploadPhoto', { dataUrl: dataUrl });
+        }).then(function (res) {
+          App.avatarCache[res.photo_file_id] = res.dataUrl;
+          App.me.photo_file_id = res.photo_file_id;
+          App.updateMeChip();
+          App.toast('Foto profil diperbarui.', 'success');
+          viewProfile(main);
+        }).catch(function (err) { App.busy(btn, false); App.toast(err.message || 'Gagal mengunggah foto.', 'error'); });
+      };
+      var del = $('#btn-photo-del');
+      if (del) del.onclick = function () {
+        App.busy(del, true);
+        api('profile.removePhoto').then(function () {
+          App.me.photo_file_id = ''; App.updateMeChip(); viewProfile(main);
+        }).catch(function (err) { App.busy(del, false); App.toast(err.message, 'error'); });
+      };
+    }).catch(function (err) { showErr(main, err); });
+  }
+
+  /** Perkecil & potong tengah jadi persegi, keluarkan JPEG data URL. */
+  function resizeImage(file, size) {
+    return new Promise(function (resolve, reject) {
+      if (!/^image\/(jpeg|png|webp)$/.test(file.type)) return reject({ message: 'Pilih gambar JPG, PNG, atau WEBP.' });
+      if (file.size > 15 * 1024 * 1024) return reject({ message: 'Ukuran gambar asli maksimal 15 MB.' });
+      var reader = new FileReader();
+      reader.onerror = function () { reject({ message: 'Gagal membaca file.' }); };
+      reader.onload = function () {
+        var img = new Image();
+        img.onerror = function () { reject({ message: 'File bukan gambar yang valid.' }); };
+        img.onload = function () {
+          var s = Math.min(img.width, img.height);
+          var c = document.createElement('canvas');
+          c.width = size; c.height = size;
+          c.getContext('2d').drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, size, size);
+          resolve(c.toDataURL('image/jpeg', 0.85));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  /* =================== Pengaturan =================== */
+  function viewSettings(main) {
+    var me = App.me, p = me.privacy || {};
+    var mode = App.themeMode();
+    var sel = function (v, label) { return '<option value="' + v + '"' + (mode === v ? ' selected' : '') + '>' + label + '</option>'; };
+    var chk = function (name, label, on) {
+      return '<label class="check" style="margin-bottom:10px"><input type="checkbox" name="' + name + '"' + (on ? ' checked' : '') + '> ' + label + '</label>';
+    };
+    main.innerHTML = '<div class="main-inner" style="max-width:720px"><div class="page-head"><div><h1>Pengaturan</h1></div></div>' +
+      '<div class="card card-pad" style="margin-bottom:16px"><h2 style="margin-bottom:12px">Tampilan</h2>' +
+      '<div class="field" style="max-width:280px;margin:0"><label>Tema</label><select class="input" id="s-theme">' +
+      sel('light', 'Terang') + sel('dark', 'Gelap') + sel('system', 'Ikuti perangkat') + '</select></div></div>' +
+      '<form class="card card-pad" id="f-privacy" style="margin-bottom:16px"><h2 style="margin-bottom:4px">Privasi</h2>' +
+      '<p class="muted small" style="margin:0 0 12px">Admin tetap dapat melihat data Anda untuk verifikasi.</p>' +
+      chk('hide_nim', 'Sembunyikan NIM dari anggota lain', p.hide_nim) +
+      chk('hide_phone', 'Sembunyikan nomor HP dari anggota lain', p.hide_phone) +
+      chk('hide_email', 'Sembunyikan email dari anggota lain', p.hide_email) +
+      chk('allow_dm', 'Izinkan anggota lain memulai chat pribadi dengan saya', p.allow_dm !== false) +
+      '<div><button class="btn btn-primary" type="submit">Simpan privasi</button></div></form>' +
+      '<div class="card card-pad" style="margin-bottom:16px"><h2 style="margin-bottom:4px">Notifikasi</h2>' +
+      '<p class="muted small" style="margin:0 0 12px">Notifikasi tampil di dalam aplikasi; email hanya dipakai untuk reset password.</p>' +
+      chk('toast_messages', 'Tampilkan pop-up saat ada pesan atau notifikasi baru', !(me.notif && me.notif.toast_messages === false)).replace('name="toast_messages"', 'id="s-toast" name="toast_messages"') + '</div>' +
+      '<form class="card card-pad" id="f-pw" style="margin-bottom:16px"><h2 style="margin-bottom:12px">Ganti password</h2><div class="alert hidden" id="pw-msg"></div>' +
+      '<div class="field"><label>Password lama</label><input class="input" type="password" name="oldPassword" autocomplete="current-password" required></div>' +
+      '<div class="row"><div class="field"><label>Password baru</label><input class="input" type="password" name="newPassword" autocomplete="new-password" required></div>' +
+      '<div class="field"><label>Ulangi password baru</label><input class="input" type="password" name="newPassword2" autocomplete="new-password" required></div></div>' +
+      '<button class="btn btn-primary" type="submit">Ganti password</button></form>' +
+      '<div class="card card-pad"><h2 style="margin-bottom:4px">Sesi</h2><p class="muted small" style="margin:0 0 12px">Keluar dari perangkat ini, atau dari semua perangkat jika akun Anda dipakai di tempat lain.</p>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="btn-logout"><i class="bi bi-box-arrow-right"></i> Keluar</button>' +
+      '<button class="btn btn-danger" id="btn-logout-all"><i class="bi bi-phone"></i> Keluar dari semua perangkat</button></div></div></div>';
+
+    $('#s-theme').onchange = function () {
+      App.applyTheme(this.value);
+      App.me.theme = this.value;
+      api('profile.update', { theme: this.value }).catch(function () {});
+    };
+    $('#s-toast').onchange = function () {
+      var on = this.checked;
+      api('profile.update', { notif: { toast_messages: on } }).then(function (me2) {
+        App.me = me2; App.toast(on ? 'Pop-up notifikasi aktif.' : 'Pop-up notifikasi dimatikan.', 'success');
+      }).catch(function (err) { App.toast(err.message, 'error'); });
+    };
+    $('#f-privacy').onsubmit = function (e) {
+      e.preventDefault();
+      var btn = $('button[type=submit]', this);
+      App.busy(btn, true);
+      api('profile.update', { privacy: App.formData(this) }).then(function (me2) {
+        App.me = me2; App.busy(btn, false); App.toast('Pengaturan privasi disimpan.', 'success');
+      }).catch(function (err) { App.busy(btn, false); App.toast(err.message, 'error'); });
+    };
+    $('#f-pw').onsubmit = function (e) {
+      e.preventDefault();
+      var form = this, btn = $('button[type=submit]', form);
+      App.busy(btn, true);
+      api('auth.changePassword', App.formData(form)).then(function (res) {
+        App.busy(btn, false); form.reset();
+        var m = $('#pw-msg'); m.className = 'alert alert-success';
+        m.textContent = res.message + (res.otherSessionsRevoked ? ' ' + res.otherSessionsRevoked + ' perangkat lain telah dikeluarkan.' : '');
+      }).catch(function (err) { App.busy(btn, false); App.showError($('#pw-msg'), err); });
+    };
+    $('#btn-logout').onclick = function () {
+      App.modal({
+        title: 'Keluar dari akun ini?',
+        body: '<p style="margin:0">Anda perlu login kembali untuk masuk ke YAPP di perangkat ini.</p>',
+        confirm: 'Keluar',
+        onConfirm: function () { App.logout(); }
+      });
+    };
+    $('#btn-logout-all').onclick = function () {
+      App.modal({
+        title: 'Keluar dari semua perangkat?',
+        body: '<p style="margin:0">Semua sesi, termasuk perangkat ini, akan diakhiri.</p>',
+        confirm: 'Keluar semua',
+        onConfirm: function () {
+          return api('auth.logoutAll').then(function () {
+            App.clearSession(); App.teardownShell(); App.go('login');
+          });
+        }
+      });
+    };
+  }
+
+  /* =================== Admin =================== */
+  var aState = { q: '', status: '', role: '', page: 1 };
+
+  function viewAdmin(main, r) {
+    var tab = r.parts[1] || 'pending';
+    var tabs = [['pending', 'Pendaftaran'], ['users', 'Pengguna'], ['logs', 'Log aktivitas']];
+    tabs.push(['system', 'Sistem & metrik']);
+    main.innerHTML = '<div class="main-inner"><div class="page-head"><div><h1>Admin Panel</h1><p>Kelola pendaftaran dan anggota komunitas.</p></div></div>' +
+      '<div class="tabs">' + tabs.map(function (t) {
+        return '<a class="tab' + (t[0] === tab ? ' active' : '') + '" data-go="admin/' + t[0] + '">' + t[1] + '</a>';
+      }).join('') + '</div><div id="a-body"><div class="skeleton" style="height:160px"></div></div></div>';
+    bindGo(main);
+    var body = $('#a-body');
+    ({ pending: adminPending, users: adminUsers, logs: adminLogs, system: adminSystem }[tab] || adminPending)(body);
+  }
+
+  function adminPending(body) {
+    api('admin.pending').then(function (d) {
+      App.setPendingBadge(d.total);
+      if (!d.items.length) {
+        body.innerHTML = '<div class="card">' + empty('bi-check2-circle', 'Tidak ada pendaftaran yang menunggu.') + '</div>';
+        return;
+      }
+      body.innerHTML = '<p class="muted" style="margin-top:0">' + d.total + ' pendaftaran menunggu. Cocokkan NIM dan angkatan dengan data jurusan sebelum menyetujui.</p>' +
+        '<div class="grid">' + d.items.map(function (u) {
+          return '<div class="card card-pad" data-id="' + esc(u.user_id) + '"><div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">' +
+            App.avatar(u, 44) + '<div style="flex:1;min-width:220px"><h2>' + esc(u.full_name) + '</h2>' +
+            '<div class="muted small">@' + esc(u.username) + ' · ' + esc(u.email) + ' · daftar ' + esc(App.timeAgo(u.created_at)) + '</div>' +
+            '<dl class="kv small" style="margin:10px 0 0"><dt>NIM</dt><dd><b>' + esc(u.nim) + '</b></dd><dt>Angkatan / Kelas</dt><dd>' +
+            esc(u.angkatan) + ' / ' + esc(u.kelas) + '</dd>' + (u.phone ? '<dt>No. HP</dt><dd>' + esc(u.phone) + '</dd>' : '') + '</dl></div>' +
+            '<div style="display:flex;gap:8px"><button class="btn btn-success" data-act="approve"><i class="bi bi-check-lg"></i> Setujui</button>' +
+            '<button class="btn btn-danger" data-act="reject"><i class="bi bi-x-lg"></i> Tolak</button></div></div></div>';
+        }).join('') + '</div>';
+      $$('[data-act]', body).forEach(function (btn) {
+        btn.onclick = function () {
+          var id = btn.closest('[data-id]').dataset.id;
+          var done = function () { App.toast(btn.dataset.act === 'approve' ? 'Pendaftaran disetujui.' : 'Pendaftaran ditolak.', 'success'); adminPending(body); };
+          if (btn.dataset.act === 'approve') {
+            App.busy(btn, true);
+            api('admin.decide', { userId: id, decision: 'approve' }).then(done)
+              .catch(function (err) { App.busy(btn, false); App.toast(err.message, 'error'); });
+          } else {
+            App.modal({
+              title: 'Tolak pendaftaran',
+              body: '<div class="field"><label>Alasan penolakan (terlihat oleh pendaftar)</label><textarea class="input" name="reason" maxlength="300" required></textarea></div>',
+              confirm: 'Tolak',
+              onConfirm: function (f) { return api('admin.decide', { userId: id, decision: 'reject', reason: f.reason }).then(done); }
+            });
+          }
+        };
+      });
+      App.hydrateAvatars(body);
+    }).catch(function (err) { body.innerHTML = errorBox(err); });
+  }
+
+  function adminUsers(body) {
+    var opt = function (v, label, cur) { return '<option value="' + v + '"' + (v === cur ? ' selected' : '') + '>' + label + '</option>'; };
+    body.innerHTML = '<div class="toolbar"><input class="input search" id="a-q" placeholder="Cari nama, email, username, NIM" value="' + esc(aState.q) + '">' +
+      '<select class="input" id="a-status">' + opt('', 'Semua status', aState.status) + opt('approved', 'Approved', aState.status) +
+      opt('pending', 'Pending', aState.status) + opt('suspended', 'Suspended', aState.status) + opt('rejected', 'Rejected', aState.status) + '</select>' +
+      '<select class="input" id="a-role">' + opt('', 'Semua role', aState.role) + opt('super_admin', 'Super Admin', aState.role) +
+      opt('admin', 'Admin', aState.role) + opt('moderator', 'Moderator', aState.role) + opt('member', 'Member', aState.role) + '</select></div>' +
+      '<div id="a-table"></div><div class="pager" id="a-pager"></div>';
+    var t = null;
+    $('#a-q').oninput = function () { var v = this.value; clearTimeout(t); t = setTimeout(function () { aState.q = v; aState.page = 1; loadUsers(); }, 350); };
+    $('#a-status').onchange = function () { aState.status = this.value; aState.page = 1; loadUsers(); };
+    $('#a-role').onchange = function () { aState.role = this.value; aState.page = 1; loadUsers(); };
+    loadUsers();
+
+    function loadUsers() {
+      var box = $('#a-table');
+      box.innerHTML = '<div class="skeleton" style="height:200px"></div>';
+      api('admin.users', aState).then(function (d) {
+        box.innerHTML = '<p class="muted small" style="margin-top:0">' + d.total + ' pengguna · Approved ' + d.counts.approved +
+          ' · Pending ' + d.counts.pending + ' · Suspended ' + d.counts.suspended + ' · Rejected ' + d.counts.rejected + '</p>' +
+          '<div class="card table-wrap"><table class="table"><thead><tr><th>Anggota</th><th>NIM</th><th>Angkatan / Kelas</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>' +
+          (d.items.length ? d.items.map(function (u) {
+            var actions = '';
+            if (u.can_manage) {
+              actions = '<button class="btn btn-sm" data-edit="' + esc(u.user_id) + '">Edit</button> ';
+              if (u.status === 'approved') actions += '<button class="btn btn-sm btn-danger" data-suspend="' + esc(u.user_id) + '">Nonaktifkan</button>';
+              if (u.status === 'suspended') actions += '<button class="btn btn-sm btn-success" data-activate="' + esc(u.user_id) + '">Aktifkan</button>';
+            }
+            return '<tr><td><div style="display:flex;gap:10px;align-items:center">' + App.avatar(u, 32, true) + '<div><div style="font-weight:500">' +
+              esc(u.full_name) + '</div><div class="muted small">' + esc(u.email) + '</div></div></div></td>' +
+              '<td>' + esc(u.nim || '-') + '</td><td>' + esc(u.angkatan || '-') + ' / ' + esc(u.kelas || '-') + '</td>' +
+              '<td>' + roleChip(u.role, u.role_label) + '</td><td>' + statusChip(u.status) +
+              (u.status_reason ? '<div class="muted small" title="' + esc(u.status_reason) + '">' + esc(u.status_reason.slice(0, 40)) + '</div>' : '') +
+              '</td><td style="white-space:nowrap;text-align:right">' + actions + '</td></tr>';
+          }).join('') : '<tr><td colspan="6">' + empty('bi-search', 'Tidak ada pengguna yang cocok.') + '</td></tr>') +
+          '</tbody></table></div>';
+        var pages = Math.ceil(d.total / d.pageSize);
+        $('#a-pager').innerHTML = pages > 1 ? '<button class="btn btn-sm" id="ap-prev"' + (d.page <= 1 ? ' disabled' : '') + '>Sebelumnya</button>' +
+          '<span class="muted small">Hal. ' + d.page + ' dari ' + pages + '</span><button class="btn btn-sm" id="ap-next"' +
+          (d.page >= pages ? ' disabled' : '') + '>Berikutnya</button>' : '';
+        if (pages > 1) {
+          $('#ap-prev').onclick = function () { aState.page--; loadUsers(); };
+          $('#ap-next').onclick = function () { aState.page++; loadUsers(); };
+        }
+        var byId = {};
+        d.items.forEach(function (u) { byId[u.user_id] = u; });
+        $$('[data-edit]', box).forEach(function (b) { b.onclick = function () { editUser(byId[b.dataset.edit], d.assignableRoles); }; });
+        $$('[data-suspend]', box).forEach(function (b) {
+          b.onclick = function () {
+            var u = byId[b.dataset.suspend];
+            App.modal({
+              title: 'Nonaktifkan ' + u.full_name + '?',
+              body: '<p style="margin-top:0">Pengguna langsung dikeluarkan dari semua perangkat dan tidak bisa login sampai diaktifkan lagi.</p>' +
+                '<div class="field"><label>Alasan (terlihat oleh pengguna)</label><textarea class="input" name="reason" maxlength="300" required></textarea></div>',
+              confirm: 'Nonaktifkan',
+              onConfirm: function (f) {
+                return api('admin.setStatus', { userId: u.user_id, status: 'suspended', reason: f.reason })
+                  .then(function () { App.toast('Akun dinonaktifkan.', 'success'); loadUsers(); });
+              }
+            });
+          };
+        });
+        $$('[data-activate]', box).forEach(function (b) {
+          b.onclick = function () {
+            App.busy(b, true);
+            api('admin.setStatus', { userId: b.dataset.activate, status: 'approved' })
+              .then(function () { App.toast('Akun diaktifkan kembali.', 'success'); loadUsers(); })
+              .catch(function (err) { App.busy(b, false); App.toast(err.message, 'error'); });
+          };
+        });
+        App.hydrateAvatars(box);
+      }).catch(function (err) { box.innerHTML = errorBox(err); });
+    }
+
+    function editUser(u, roles) {
+      var roleSel = '<select class="input" name="role">' + roles.map(function (r) {
+        return '<option value="' + r.value + '"' + (r.value === u.role ? ' selected' : '') + '>' + esc(r.label) + '</option>';
+      }).join('') + '</select>';
+      App.modal({
+        title: 'Edit ' + u.full_name,
+        body: '<div class="field"><label>Nama lengkap</label><input class="input" name="full_name" value="' + esc(u.full_name) + '" required></div>' +
+          '<div class="row"><div class="field"><label>NIM</label><input class="input" name="nim" value="' + esc(u.nim) + '"></div>' +
+          '<div class="field"><label>Jabatan</label><input class="input" name="jabatan" value="' + esc(u.jabatan) + '" placeholder="mis. Ketua, Sekretaris"></div></div>' +
+          '<div class="row"><div class="field"><label>Angkatan</label><select class="input" name="angkatan">' + yearOptions(u.angkatan) + '</select></div>' +
+          '<div class="field"><label>Kelas</label><input class="input" name="kelas" value="' + esc(u.kelas) + '"></div></div>' +
+          '<div class="field"><label>Role</label>' + roleSel + '<span class="hint">Anda hanya bisa memberi role di bawah role Anda.</span></div>',
+        confirm: 'Simpan',
+        onConfirm: function (f) {
+          return api('admin.updateProfile', { userId: u.user_id, full_name: f.full_name, nim: f.nim, jabatan: f.jabatan, angkatan: f.angkatan, kelas: f.kelas })
+            .then(function () { return f.role !== u.role ? api('admin.setRole', { userId: u.user_id, role: f.role }) : null; })
+            .then(function () { App.toast('Data pengguna disimpan.', 'success'); loadUsers(); });
+        }
+      });
+    }
+  }
+
+  function adminLogs(body) {
+    api('admin.logs', { page: 1 }).then(function (d) {
+      body.innerHTML = d.items.length ? '<div class="card table-wrap"><table class="table"><thead><tr><th>Waktu</th><th>Pelaku</th><th>Tindakan</th><th>Target</th><th>Keterangan</th></tr></thead><tbody>' +
+        d.items.map(function (l) {
+          var det = '';
+          if (l.detail && l.detail.reason) det = l.detail.reason;
+          else if (l.detail && l.detail.to) det = l.detail.from + ' → ' + l.detail.to;
+          else if (l.detail && l.detail.fields) det = l.detail.fields.join(', ');
+          return '<tr><td class="small" style="white-space:nowrap">' + esc(App.fmtDate(l.created_at, true)) + '</td><td>' + esc(l.actor) +
+            '</td><td>' + esc(l.action_label) + '</td><td>' + esc(l.target || '-') + '</td><td class="muted small">' + esc(det) + '</td></tr>';
+        }).join('') + '</tbody></table></div>' : '<div class="card">' + empty('bi-journal-text', 'Belum ada aktivitas admin.') + '</div>';
+    }).catch(function (err) { body.innerHTML = errorBox(err); });
+  }
+
+  function adminSystem(body) {
+    var isSuper = App.me.role === 'super_admin';
+    body.innerHTML = '<div class="card card-pad" style="margin-bottom:16px"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+      '<h2 style="flex:1">Metrik 30 menit terakhir</h2><span class="muted small" id="mt-upd"></span>' +
+      '<label class="check small"><input type="checkbox" id="mt-auto" checked> Perbarui otomatis (15 dtk)</label></div>' +
+      '<div id="mt-body"><div class="skeleton" style="height:160px;margin-top:12px"></div></div></div>' +
+      (isSuper ? '<form class="card card-pad" id="f-settings" style="margin-bottom:16px"><h2 style="margin-bottom:12px">Pengaturan aplikasi</h2><div id="st-body"></div></form>' : '') +
+      (isSuper ? '<div class="card card-pad"><h2 style="margin-bottom:6px">Backup database</h2>' +
+        '<p class="muted" style="margin-top:0">Backup otomatis berjalan setiap hari pukul 03.00 (jika trigger sudah dipasang) dan menyimpan 14 salinan terakhir di folder backups.</p>' +
+        '<button class="btn btn-primary" id="btn-backup"><i class="bi bi-cloud-arrow-up"></i> Backup sekarang</button></div>' : '');
+
+    var loadMetrics = function () {
+      var box = $('#mt-body');
+      if (!box) return false;
+      api('admin.metrics', { minutes: 30 }).then(function (m) {
+        if (!$('#mt-body')) return;
+        var s = m.summary, maxN = Math.max.apply(null, m.buckets.map(function (b) { return b.n; }).concat([1]));
+        var maxAvg = Math.max.apply(null, m.buckets.map(function (b) { return b.avg; }).concat([1]));
+        var tile = function (v, label, warn) {
+          return '<div class="mt-tile' + (warn ? ' warn' : '') + '"><b>' + esc(v) + '</b><span>' + esc(label) + '</span></div>';
+        };
+        var pct = Math.round((m.cells.main + m.cells.msg) / m.cells.limit * 1000) / 10;
+        $('#mt-body').innerHTML =
+          '<div class="mt-tiles">' + tile(m.online, 'Online sekarang') + tile(s.requests, 'Permintaan') + tile(s.perMinutePeak + '/mnt', 'Puncak') +
+          tile(s.syncAvgMs + ' ms', 'Rata-rata sinkronisasi', s.syncAvgMs > 1500) + tile(s.maxMs + ' ms', 'Paling lambat', s.maxMs > 5000) +
+          tile(s.serverErrors + s.busy, 'Error server / sibuk', s.serverErrors + s.busy > 0) + tile(s.clientErrors, 'Gagal di browser*', s.clientErrors > 0) + '</div>' +
+          '<div class="mt-chart" title="Batang = jumlah permintaan per menit; garis merah = rata-rata waktu proses">' + m.buckets.map(function (b) {
+            return '<div class="mt-col" title="' + esc(new Date(b.t).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })) + ' — ' + b.n + ' permintaan, rata-rata ' + b.avg +
+              ' ms, maks ' + b.max + ' ms' + (b.cerr ? ', ' + b.cerr + ' gagal di browser' : '') + '"><span class="mt-bar' + (b.err || b.busy || b.cerr ? ' bad' : '') +
+              '" style="height:' + Math.round(b.n / maxN * 100) + '%"></span><span class="mt-dot" style="bottom:' + Math.round(b.avg / maxAvg * 100) + '%"></span></div>';
+          }).join('') + '</div><div class="muted small" style="display:flex;justify-content:space-between"><span>30 menit lalu</span><span>sekarang</span></div>' +
+          '<p class="muted small" style="margin:12px 0 0">* "Gagal di browser" termasuk penolakan Google karena batas 30 eksekusi bersamaan; angka ini dilaporkan browser pada sinkronisasi berikutnya. ' +
+          'Metrik bersifat perkiraan.</p>' +
+          '<div class="grid grid-2" style="margin-top:14px"><div><h3 style="margin-bottom:6px">Data tersimpan</h3>' +
+          m.storage.map(function (x) { return '<div class="small" style="display:flex;justify-content:space-between"><span>' + esc(x.table) + '</span><b>' + x.rows + ' baris</b></div>'; }).join('') +
+          '</div><div><h3 style="margin-bottom:6px">Kapasitas & kuota</h3>' +
+          '<div class="small" style="display:flex;justify-content:space-between"><span>Sel terpakai (batas 10 juta/file)</span><b>' + pct + '%</b></div>' +
+          '<div class="small" style="display:flex;justify-content:space-between"><span>Sisa kuota email hari ini</span><b>' + m.mailQuota + '</b></div></div></div>';
+        $('#mt-upd').textContent = 'Diperbarui ' + new Date().toLocaleTimeString('id-ID');
+      }).catch(function (err) { var b = $('#mt-body'); if (b) b.innerHTML = '<div class="alert alert-error">' + esc(err.message) + '</div>'; });
+      return true;
+    };
+    loadMetrics();
+    var timer = setInterval(function () {
+      if (!$('#mt-body')) { clearInterval(timer); return; }
+      if ($('#mt-auto').checked && !document.hidden) loadMetrics();
+    }, 15000);
+
+    if (isSuper) {
+      api('app.config').then(function (c) {
+        $('#st-body').innerHTML =
+          '<label class="check" style="margin-bottom:10px"><input type="checkbox" name="registration_open"' + (c.registrationOpen ? ' checked' : '') + '> Pendaftaran anggota baru dibuka</label>' +
+          '<label class="check" style="margin-bottom:14px"><input type="checkbox" name="resource_needs_approval" id="st-appr"> Materi dari Member perlu persetujuan Moderator</label>' +
+          '<div class="field"><label>Banner informasi <span class="muted">(tampil di halaman login & dashboard; kosongkan untuk menyembunyikan)</span></label>' +
+          '<input class="input" name="info_banner" maxlength="300" value="' + esc(c.infoBanner || '') + '" placeholder="mis. Pemeliharaan sistem Sabtu 22.00–23.00 WIB"></div>' +
+          '<button class="btn btn-primary" type="submit">Simpan pengaturan</button>';
+        $('#st-appr').checked = c.resourceNeedsApproval !== false;
+      });
+      $('#f-settings').onsubmit = function (e) {
+        e.preventDefault();
+        var btn = $('button[type=submit]', this), f = App.formData(this);
+        App.busy(btn, true);
+        api('settings.update', f).then(function (st) {
+          App.busy(btn, false);
+          App.boot.registrationOpen = st.registration_open; App.boot.infoBanner = st.info_banner;
+          App.toast('Pengaturan disimpan.', 'success');
+        }).catch(function (err) { App.busy(btn, false); App.toast(err.message, 'error'); });
+      };
+      $('#btn-backup').onclick = function () {
+        var b = this;
+        App.busy(b, true);
+        api('admin.backupNow').then(function (res) { App.busy(b, false); App.toast(res.message, 'success'); })
+          .catch(function (err) { App.busy(b, false); App.toast(err.message, 'error'); });
+      };
+    }
+  }
+
+  App.routes = {
+    dashboard: { title: 'Dashboard', view: viewDashboard },
+    members: { title: 'Anggota', view: function (main, r) { return r.parts[1] ? viewMember(main, r.parts[1]) : viewMembers(main); } },
+    profile: { title: 'Profil Saya', view: viewProfile },
+    settings: { title: 'Pengaturan', view: viewSettings },
+    admin: { title: 'Admin Panel', view: viewAdmin, admin: true },
+    notfound: { title: 'Tidak ditemukan', view: function (main) {
+      main.innerHTML = '<div class="main-inner"><div class="card">' + empty('bi-signpost', 'Halaman tidak ditemukan.') +
+        '<div style="text-align:center;padding-bottom:20px"><a class="btn" data-go="dashboard">Ke dashboard</a></div></div></div>';
+      bindGo(main);
+    } }
+  };
+})();
+</script>

@@ -1,0 +1,640 @@
+<script>
+/* js_app — inti aplikasi: API, sesi, router, kerangka tampilan, tema, avatar, heartbeat. */
+var App = {
+  boot: window.BOOT || {},
+  token: null,
+  me: null,
+  statusInfo: null,          // hasil login untuk akun pending/rejected/suspended
+  avatarCache: {},
+  path: '',
+  shellReady: false,
+  inbox: { items: [], unreadTotal: 0, notifUnread: 0 },
+  iv: '',
+  chat: null,                // diisi halaman chat saat sebuah percakapan terbuka
+  thumbCache: {},
+  views: {},
+  publicPaths: ['login', 'register', 'forgot', 'reset', 'status']
+};
+
+/* ---------- Penyimpanan lokal (dibungkus try: bisa diblokir browser) ---------- */
+App.store = {
+  get: function (k) {
+    try { return sessionStorage.getItem(k) || localStorage.getItem(k); } catch (e) { return null; }
+  },
+  set: function (k, v, persistent) {
+    try { (persistent ? localStorage : sessionStorage).setItem(k, v); } catch (e) {}
+  },
+  remove: function (k) {
+    try { sessionStorage.removeItem(k); localStorage.removeItem(k); } catch (e) {}
+  }
+};
+
+App.deviceId = function () {
+  var id = null;
+  try { id = localStorage.getItem('yapp_device'); } catch (e) {}
+  if (!id) {
+    id = 'd' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    try { localStorage.setItem('yapp_device', id); } catch (e) {}
+  }
+  return id;
+};
+
+/* ---------- Pemanggilan server ---------- */
+App.api = function (action, data) {
+  return new Promise(function (resolve, reject) {
+    if (!window.google || !google.script || !google.script.run) {
+      reject({ code: 'OFFLINE', message: 'Aplikasi harus dibuka dari URL web app Apps Script.' });
+      return;
+    }
+    google.script.run
+      .withSuccessHandler(function (res) {
+        if (!res) return reject({ code: 'SERVER', message: 'Respons server kosong.' });
+        if (res.ok) return resolve(res.data);
+        if (res.error.code === 'AUTH' && App.token) App.onAuthLost(res.error.message);
+        reject(res.error);
+      })
+      .withFailureHandler(function () {
+        App.clientErrors = (App.clientErrors || 0) + 1;   // termasuk penolakan "too many simultaneous invocations"
+        reject({ code: 'NETWORK', message: 'Gagal terhubung ke server. Periksa koneksi lalu coba lagi.' });
+      })
+      .api(action, App.token, data || {});
+  });
+};
+
+/* ---------- Utilitas tampilan ---------- */
+App.esc = function (s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+};
+var esc = App.esc;
+
+/**
+ * Teks pengguna → HTML aman. Tautan http(s) dikenali dari teks MENTAH (berhenti di spasi, < > " '),
+ * lalu setiap bagian di-escape. Baris baru → <br>.
+ */
+App.richText = function (s) {
+  var text = String(s === null || s === undefined ? '' : s);
+  var re = /https?:\/\/[^\s<>"'`]+/g, out = '', last = 0, m;
+  while ((m = re.exec(text))) {
+    var url = m[0].replace(/[.,;:!?)\]]+$/, '');
+    out += esc(text.slice(last, m.index)) +
+      '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(url) + '</a>';
+    last = m.index + url.length;
+    re.lastIndex = last;
+  }
+  return (out + esc(text.slice(last))).replace(/\n/g, '<br>');
+};
+
+App.$ = function (sel, root) { return (root || document).querySelector(sel); };
+App.$$ = function (sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); };
+
+App.toast = function (msg, type) {
+  var box = document.getElementById('toasts');
+  var el = document.createElement('div');
+  el.className = 'toast ' + (type || '');
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(function () { el.remove(); }, type === 'error' ? 6000 : 3500);
+};
+
+App.busy = function (btn, on) {
+  if (!btn) return;
+  if (on) {
+    btn.dataset.label = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.label) btn.innerHTML = btn.dataset.label;
+  }
+};
+
+App.formData = function (form) {
+  var out = {};
+  App.$$('input, select, textarea', form).forEach(function (el) {
+    if (!el.name) return;
+    out[el.name] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  return out;
+};
+
+App.showError = function (box, err) {
+  if (!box) return App.toast(err.message || String(err), 'error');
+  box.className = 'alert alert-error';
+  box.textContent = (err && err.message) || 'Terjadi kesalahan.';
+  box.classList.remove('hidden');
+};
+
+App.fmtDate = function (iso, withTime) {
+  if (!iso) return '-';
+  var d = new Date(iso);
+  if (isNaN(d)) return '-';
+  var opt = { day: 'numeric', month: 'short', year: 'numeric' };
+  if (withTime) { opt.hour = '2-digit'; opt.minute = '2-digit'; }
+  return d.toLocaleString('id-ID', opt);
+};
+
+App.timeAgo = function (iso) {
+  if (!iso) return '-';
+  var s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (isNaN(s)) return '-';
+  if (s < 60) return 'baru saja';
+  if (s < 3600) return Math.floor(s / 60) + ' menit lalu';
+  if (s < 86400) return Math.floor(s / 3600) + ' jam lalu';
+  if (s < 604800) return Math.floor(s / 86400) + ' hari lalu';
+  return App.fmtDate(iso);
+};
+
+App.modal = function (opts) {
+  var root = document.getElementById('modal-root');
+  root.innerHTML =
+    '<div class="modal-backdrop"><div class="modal" role="dialog" aria-modal="true">' +
+    '<div class="modal-head">' + esc(opts.title) + '</div>' +
+    '<form class="modal-form"><div class="modal-body"><div class="alert hidden"></div>' + (opts.body || '') + '</div>' +
+    '<div class="modal-foot"><button type="button" class="btn" data-cancel>Batal</button>' +
+    '<button type="submit" class="btn ' + (opts.confirmClass || 'btn-primary') + '">' + esc(opts.confirm || 'Simpan') + '</button></div>' +
+    '</form></div></div>';
+  var close = function () { root.innerHTML = ''; };
+  var form = App.$('.modal-form', root);
+  App.$('[data-cancel]', root).onclick = close;
+  App.$('.modal-backdrop', root).addEventListener('mousedown', function (e) {
+    if (e.target.classList.contains('modal-backdrop')) close();
+  });
+  form.onsubmit = function (e) {
+    e.preventDefault();
+    var btn = App.$('button[type=submit]', form);
+    App.busy(btn, true);
+    Promise.resolve(opts.onConfirm(App.formData(form)))
+      .then(function () { close(); })
+      .catch(function (err) { App.busy(btn, false); App.showError(App.$('.alert', root), err); });
+  };
+  var first = App.$('input, textarea, select', form);
+  if (first) first.focus();
+  return { close: close };
+};
+
+
+/* ---------- Logo ---------- */
+App.logo = function (width, cls) {
+  var w = width || 32, h = Math.round(w * 1952 / 1746);
+  return '<span class="logo ' + (cls || '') + '" style="width:' + w + 'px;height:' + h + 'px">' + (window.YAPP_LOGO || '') + '</span>';
+};
+
+/* ---------- Avatar ---------- */
+App.initials = function (name) {
+  var parts = String(name || '?').trim().split(/\s+/);
+  return ((parts[0] || '?').charAt(0) + (parts.length > 1 ? parts[parts.length - 1].charAt(0) : '')).toUpperCase();
+};
+
+App.avatar = function (p, size, showOnline, square) {
+  size = size || 36;
+  var fid = p.photo_file_id || '';
+  var cached = fid && App.avatarCache[fid];
+  return '<span class="avatar' + (cached ? ' has-img' : '') + (square ? ' square' : '') + '" data-fid="' + esc(fid) + '" style="width:' + size +
+    'px;height:' + size + 'px;font-size:' + Math.round(size * 0.38) + 'px;' +
+    (cached ? 'background-image:url(' + cached + ')' : '') + '">' + esc(App.initials(p.full_name)) +
+    (showOnline && p.online ? '<span class="dot" title="Online"></span>' : '') + '</span>';
+};
+
+App.hydrateAvatars = function (root) {
+  var els = App.$$('.avatar[data-fid]', root || document).filter(function (el) { return el.dataset.fid; });
+  var missing = [];
+  els.forEach(function (el) {
+    var url = App.avatarCache[el.dataset.fid];
+    if (url) { el.style.backgroundImage = 'url(' + url + ')'; el.classList.add('has-img'); }
+    else if (missing.indexOf(el.dataset.fid) < 0) missing.push(el.dataset.fid);
+  });
+  if (!missing.length) return;
+  App.api('files.avatars', { fileIds: missing.slice(0, 60) }).then(function (map) {
+    Object.keys(map || {}).forEach(function (k) { App.avatarCache[k] = map[k]; });
+    App.$$('.avatar[data-fid]').forEach(function (el) {
+      var url = App.avatarCache[el.dataset.fid];
+      if (url) { el.style.backgroundImage = 'url(' + url + ')'; el.classList.add('has-img'); }
+    });
+  }).catch(function () {});
+};
+
+/* ---------- Tema, fullscreen, refresh ---------- */
+App.themeMode = function () { return App.store.get('yapp_theme') || 'light'; };
+
+App.applyTheme = function (mode) {
+  mode = mode || 'light';
+  var dark = mode === 'dark' ||
+    (mode === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  App.store.set('yapp_theme', mode, true);
+};
+
+App.toggleTheme = function () {
+  var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  App.applyTheme(next);
+  if (App.me) {
+    App.me.theme = next;
+    App.api('profile.update', { theme: next }).catch(function () {});
+  }
+};
+
+App.toggleFullscreen = function () {
+  var doc = document;
+  if (doc.fullscreenElement) { doc.exitFullscreen(); return; }
+  if (document.body.classList.contains('focus-mode')) {
+    document.body.classList.remove('focus-mode');
+    return;
+  }
+  var el = doc.documentElement;
+  var fallback = function () {
+    document.body.classList.add('focus-mode');
+    App.toast('Layar penuh diblokir browser. Mode fokus diaktifkan; klik lagi untuk keluar.');
+  };
+  if (!el.requestFullscreen || doc.fullscreenEnabled === false) return fallback();
+  try {
+    var p = el.requestFullscreen();
+    if (p && p.catch) p.catch(fallback);
+  } catch (e) { fallback(); }
+};
+
+App.refresh = function () {
+  App.render(App.path, true);
+  App.syncNow(true);
+};
+
+/* ---------- Dialog umum (tanpa form) ---------- */
+App.dialog = function (opts) {
+  var root = document.getElementById('modal-root');
+  root.innerHTML = '<div class="modal-backdrop"><div class="modal ' + (opts.wide ? 'modal-wide' : '') + '" role="dialog" aria-modal="true">' +
+    '<div class="modal-head" style="display:flex;align-items:center;gap:8px"><span style="flex:1">' + esc(opts.title || '') + '</span>' +
+    '<button class="btn btn-ghost btn-icon btn-sm" data-close title="Tutup">&#x2715;</button></div>' +
+    '<div class="modal-body">' + (opts.body || '') + '</div>' + (opts.footer ? '<div class="modal-foot">' + opts.footer + '</div>' : '') +
+    '</div></div>';
+  var el = App.$('.modal', root);
+  var close = function () { root.innerHTML = ''; if (opts.onClose) opts.onClose(); };
+  App.$('[data-close]', root).onclick = close;
+  App.$('.modal-backdrop', root).addEventListener('mousedown', function (e) {
+    if (e.target.classList.contains('modal-backdrop')) close();
+  });
+  return { el: el, close: close };
+};
+
+App.fmtSize = function (n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return Math.round(n / 1024) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+};
+
+/* ---------- Router ---------- */
+App.parse = function (path) {
+  path = String(path || '').replace(/^#?\/?/, '');
+  var parts = path.split('/').filter(Boolean);
+  return { path: path, parts: parts, name: parts[0] || '' };
+};
+
+App.go = function (path) {
+  if (App.path === path) return App.render(path);
+  try {
+    if (google.script.history) google.script.history.push({ path: path }, {}, path);
+    else location.hash = path;
+  } catch (e) { try { location.hash = path; } catch (e2) {} }
+  App.render(path);
+};
+
+App.render = function (path, isRefresh) {
+  var r = App.parse(path);
+  if (!r.name) r = App.parse(App.me ? 'dashboard' : 'login');
+  App.path = r.path;
+
+  if (App.publicPaths.indexOf(r.name) >= 0) {
+    if (App.me && r.name !== 'reset') return App.go('dashboard');
+    App.teardownShell();
+    var pub = App.views['public_' + r.name];
+    document.getElementById('app').innerHTML = pub ? pub(r) : '';
+    if (pub && App.views['bind_' + r.name]) App.views['bind_' + r.name](r);
+    window.scrollTo(0, 0);
+    return;
+  }
+  if (!App.me) return App.go('login');
+
+  App.renderShell();
+  var route = App.routes[r.name] || App.routes.notfound;
+  if (route.admin && ['super_admin', 'admin'].indexOf(App.me.role) < 0) route = App.routes.notfound;
+  if (route.mod && !App.isMod()) route = App.routes.notfound;
+  App.$('#page-title').textContent = route.title;
+  App.$$('.nav-item, .bottom-nav a').forEach(function (a) {
+    a.classList.toggle('active', a.dataset.path === r.name);
+  });
+  document.body.classList.remove('drawer-open', 'in-thread');
+  if (r.name !== 'chat' && App.chat) App.chat = null;
+  var main = App.$('#main');
+  main.classList.toggle('is-chat', r.name === 'chat');
+  if (!isRefresh) main.scrollTop = 0;
+  main.innerHTML = '<div class="main-inner"><div class="skeleton" style="height:28px;width:40%;margin-bottom:16px"></div>' +
+    '<div class="skeleton" style="height:120px"></div></div>';
+  route.view(main, r);
+};
+
+/* ---------- Kerangka aplikasi ---------- */
+App.NAV = [
+  { group: 'Menu' },
+  { path: 'dashboard', icon: 'bi-house-door', label: 'Dashboard' },
+  { path: 'forum', icon: 'bi-chat-square-text', label: 'Forum Diskusi' },
+  { path: 'chat', icon: 'bi-chat-dots', label: 'Chat', badge: 'chat' },
+  { path: 'groups', icon: 'bi-people', label: 'Grup' },
+  { path: 'members', icon: 'bi-person-lines-fill', label: 'Anggota' },
+  { path: 'resources', icon: 'bi-journal-bookmark', label: 'Materi' },
+  { path: 'announcements', icon: 'bi-megaphone', label: 'Pengumuman' },
+  { path: 'events', icon: 'bi-calendar-event', label: 'Agenda' },
+  { path: 'notifications', icon: 'bi-bell', label: 'Notifikasi', badge: 'notif' },
+  { group: 'Akun' },
+  { path: 'profile', icon: 'bi-person-circle', label: 'Profil Saya' },
+  { path: 'settings', icon: 'bi-gear', label: 'Pengaturan' },
+  { group: 'Pengurus', mod: true },
+  { path: 'moderation', icon: 'bi-flag', label: 'Moderasi', mod: true, badge: 'reports' },
+  { path: 'admin', icon: 'bi-shield-check', label: 'Admin Panel', admin: true, badge: 'pending' }
+];
+
+App.isAdmin = function () { return App.me && ['super_admin', 'admin'].indexOf(App.me.role) >= 0; };
+App.isMod = function () { return App.me && ['super_admin', 'admin', 'moderator'].indexOf(App.me.role) >= 0; };
+
+App.renderShell = function () {
+  if (App.shellReady) return;
+  var navHtml = App.NAV.filter(function (n) { return (!n.admin || App.isAdmin()) && (!n.mod || App.isMod()); }).map(function (n) {
+    if (n.group) return '<div class="nav-label">' + esc(n.group) + '</div>';
+    return '<a class="nav-item" data-path="' + n.path + '" title="' + esc(n.label) + '"><i class="bi ' + n.icon + '"></i><span>' +
+      esc(n.label) + '</span>' + (n.soon ? '<em class="soon">' + n.soon + '</em>' : '') +
+      (n.badge ? '<b class="badge hidden" id="badge-' + n.badge + '">0</b>' : '') + '</a>';
+  }).join('');
+
+  document.getElementById('app').innerHTML =
+    '<div class="shell">' +
+    '<aside class="sidebar"><div class="brand">' + App.logo(34) +
+    '<div class="brand-text"><div class="wordmark">' + esc(App.boot.appName || 'YAPP') + '</div><div class="brand-sub">' +
+    esc(App.boot.tagline || '') + '</div></div></div>' +
+    '<nav class="nav">' + navHtml + '</nav></aside>' +
+    '<div class="drawer-backdrop" id="drawer-backdrop"></div>' +
+    '<header class="header">' +
+    App.logo(26, 'header-logo') +
+    '<div class="title" id="page-title"></div>' +
+    '<button class="btn btn-ghost btn-icon" id="btn-search" title="Cari (Ctrl+K)">' + App.icon('search', 19) + '</button>' +
+    '<button class="btn btn-ghost btn-icon" id="btn-refresh" title="Muat ulang data"><i class="bi bi-arrow-clockwise"></i></button>' +
+    '<button class="btn btn-ghost btn-icon hide-sm" id="btn-fullscreen" title="Layar penuh"><i class="bi bi-arrows-fullscreen"></i></button>' +
+    '<button class="switch" id="btn-theme" title="Mode terang/gelap" role="switch"><span class="knob">' +
+    '<i class="bi bi-sun-fill i-sun"></i><i class="bi bi-moon-stars-fill i-moon"></i></span></button>' +
+    '<span class="divider hide-sm"></span>' +
+    '<a class="btn btn-ghost" id="btn-me" data-path="profile" style="padding:0 4px;height:44px">' + App.avatar(App.me, 34) + '</a>' +
+    '</header>' +
+    '<main class="main" id="main"></main>' +
+    '<aside class="right" id="right"><h3 style="margin-bottom:8px">Online sekarang <span class="muted" id="online-count"></span></h3>' +
+    '<div id="online-list"><div class="skeleton" style="height:120px"></div></div>' +
+    '<div style="margin-top:22px;padding:16px;border-radius:16px;background:var(--primary-soft)"><div class="eyebrow" style="margin:0 0 4px">' +
+    esc(App.boot.appName || 'YAPP') + '</div><p class="small" style="margin:0;color:var(--text-2)">' + esc(App.boot.tagline || '') +
+    '. Mulai diskusi di forum atau sapa anggota yang sedang online.</p></div>' +
+    '</aside>' +
+    '<nav class="bottom-nav">' +
+    '<a data-path="dashboard"><i class="bi bi-house-door"></i>Beranda</a>' +
+    '<a data-path="chat"><i class="bi bi-chat-dots"></i>Chat<b class="badge nb hidden" id="bn-chat">0</b></a>' +
+    '<a data-path="forum"><i class="bi bi-chat-square-text"></i>Forum</a>' +
+    '<a data-path="notifications"><i class="bi bi-bell"></i>Notifikasi<b class="badge nb hidden" id="bn-notif">0</b></a>' +
+    '<a id="btn-more"><i class="bi bi-grid"></i>Menu</a>' +
+    '</nav></div>';
+
+  App.$$('[data-path]').forEach(function (a) {
+    a.addEventListener('click', function (e) { e.preventDefault(); App.go(a.dataset.path); });
+  });
+  var drawer = function () { document.body.classList.toggle('drawer-open'); };
+  App.$('#btn-more').onclick = drawer;
+  App.$('#drawer-backdrop').onclick = drawer;
+  App.$('#btn-refresh').onclick = App.refresh;
+  App.$('#btn-search').onclick = function () { App.globalSearch(); };
+  App.$('#btn-fullscreen').onclick = App.toggleFullscreen;
+  App.$('#btn-theme').onclick = App.toggleTheme;
+
+  App.shellReady = true;
+  App.hydrateAvatars();
+  App.updateBadges();
+  App.syncNow(true);
+};
+
+App.teardownShell = function () {
+  App.shellReady = false;
+  App.stopSync();
+  App.chat = null;
+  document.body.classList.remove('focus-mode', 'drawer-open');
+};
+
+App.updateMeChip = function () {
+  var el = App.$('#btn-me');
+  if (el && App.me) { el.innerHTML = App.avatar(App.me, 34); App.hydrateAvatars(el); }
+};
+
+/* ---------- Heartbeat & panel kanan ---------- */
+App.renderOnline = function (online) {
+  var list = App.$('#online-list');
+  if (!list || !online) return;
+  App.$('#online-count').textContent = '(' + online.total + ')';
+  list.innerHTML = online.items.length ? online.items.map(function (m) {
+    return '<div class="list-item" style="cursor:pointer" data-member="' + esc(m.user_id) + '">' + App.avatar(m, 32, true) +
+      '<div class="meta"><div class="name">' + esc(m.full_name) + '</div><div class="muted small">' +
+      esc(m.jabatan || m.role_label) + '</div></div></div>';
+  }).join('') : '<div class="empty small">Belum ada anggota lain yang online.</div>';
+  App.$$('[data-member]', list).forEach(function (el) {
+    el.onclick = function () { App.go('members/' + el.dataset.member); };
+  });
+  App.hydrateAvatars(list);
+};
+
+App.setPendingBadge = function (n) {
+  var b = App.$('#badge-pending');
+  if (!b || n === undefined) return;
+  b.textContent = n;
+  b.classList.toggle('hidden', !n);
+};
+
+App.setBadge = function (ids, n) {
+  ids.forEach(function (id) {
+    var b = document.getElementById(id);
+    if (!b) return;
+    b.textContent = n > 99 ? '99+' : n;
+    b.classList.toggle('hidden', !n);
+  });
+};
+
+App.updateBadges = function () {
+  App.setBadge(['badge-chat', 'bn-chat'], App.inbox.unreadTotal || 0);
+  App.setBadge(['badge-notif', 'bn-notif'], App.inbox.notifUnread || 0);
+};
+
+/* ---------- Sinkronisasi adaptif (pengganti auto refresh) ----------
+ * 3 dtk  : percakapan sedang dibuka
+ * 10 dtk : halaman lain
+ * 30 dtk : tidak ada aktivitas > 2 menit
+ * berhenti saat tab tersembunyi; langsung sinkron saat kembali.
+ * Hanya satu permintaan berjalan pada satu waktu; gagal → jeda digandakan (maks. 30 dtk). */
+App.syncState = { timer: null, inflight: false, failures: 0, lastActivity: Date.now(), lastOnlineAt: 0, booted: false };
+
+App.syncInterval = function () {
+  var s = App.syncState;
+  var idle = Date.now() - s.lastActivity > 120000;
+  var cfg = App.boot.sync || { open: 3000, other: 10000, idle: 30000 };
+  var base = idle ? cfg.idle : (App.chat ? cfg.open : cfg.other);
+  if (s.failures) base = Math.min(Math.max(30000, cfg.idle), base * Math.pow(2, s.failures));
+  return base;
+};
+
+App.scheduleSync = function () {
+  var s = App.syncState;
+  clearTimeout(s.timer);
+  if (!App.me || !App.shellReady || document.hidden) return;
+  s.timer = setTimeout(App.syncTick, App.syncInterval());
+};
+
+App.syncNow = function (forceOnline) {
+  if (forceOnline) App.syncState.lastOnlineAt = 0;
+  clearTimeout(App.syncState.timer);
+  App.syncTick();
+};
+
+App.stopSync = function () {
+  clearTimeout(App.syncState.timer);
+  App.syncState.timer = null;
+};
+
+App.syncTick = function () {
+  var s = App.syncState;
+  if (!App.me || !App.shellReady || document.hidden) return;
+  if (s.inflight) return App.scheduleSync();
+  var data = { iv: App.iv, wantOnline: Date.now() - s.lastOnlineAt > 60000, cerr: App.clientErrors || 0 };
+  var sentErrors = data.cerr;
+  var chat = App.chat;
+  if (chat && chat.convId) {
+    data.convId = chat.convId; data.cv = chat.cv; data.rv = chat.rv; data.visible = !document.hidden;
+  }
+  s.inflight = true;
+  App.api('chat.sync', data).then(function (res) {
+    s.failures = 0;
+    App.clientErrors = Math.max(0, (App.clientErrors || 0) - sentErrors);
+    if (res.openReports !== undefined) App.setBadge(['badge-reports'], res.openReports);
+    if (res.online) { s.lastOnlineAt = Date.now(); App.renderOnline(res.online); }
+    if (res.pendingCount !== undefined) App.setPendingBadge(res.pendingCount);
+    if (res.inbox) {
+      var prev = App.inbox;
+      App.iv = res.iv;
+      App.inbox = res.inbox;
+      App.updateBadges();
+      if (s.booted) App.announceNew(prev, res.inbox);
+      s.booted = true;
+      if (App.onInbox) App.onInbox(res.inbox);
+    }
+    var c = App.chat;
+    if (c && c.convId) {
+      if (res.conv && res.conv.conv_id === c.convId) c.onConv(res.conv);
+      if (res.reads && res.reads.conv_id === c.convId) c.onReads(res.reads);
+      if (res.presence && res.presence.conv_id === c.convId) c.onPresence(res.presence.online);
+      if (res.removed === c.convId) c.onRemoved();
+    }
+  }).catch(function (err) {
+    if (err && err.code !== 'AUTH') s.failures = Math.min(s.failures + 1, 4);
+  }).then(function () {
+    s.inflight = false;
+    App.scheduleSync();
+  });
+};
+
+/** Pop-up singkat saat ada pesan baru di percakapan yang sedang tidak dibuka. */
+App.announceNew = function (prev, next) {
+  if (App.me && App.me.notif && App.me.notif.toast_messages === false) return;
+  var before = {};
+  prev.items.forEach(function (c) { before[c.conv_id] = c.unread; });
+  next.items.forEach(function (c) {
+    var open = App.chat && App.chat.convId === c.conv_id;
+    if (!open && !c.muted && c.unread > (before[c.conv_id] || 0)) {
+      App.toast((c.type === 'group' ? c.name + ' — ' : c.name + ': ') + (c.preview || 'Pesan baru'));
+    }
+  });
+  if (next.notifUnread > prev.notifUnread) App.toast('Notifikasi baru (' + next.notifUnread + ')');
+};
+
+(function () {
+  var bump = function () {
+    var s = App.syncState, wasIdle = Date.now() - s.lastActivity > 120000;
+    s.lastActivity = Date.now();
+    if (wasIdle) App.syncNow();
+  };
+  var last = 0;
+  ['mousemove', 'keydown', 'touchstart', 'scroll', 'click'].forEach(function (ev) {
+    document.addEventListener(ev, function () {
+      if (Date.now() - last > 2000) { last = Date.now(); bump(); }
+    }, { passive: true, capture: true });
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) App.stopSync(); else { App.syncState.lastActivity = Date.now(); App.syncNow(); }
+  });
+})();
+
+/* ---------- Sesi ---------- */
+App.startSession = function (token, me, remember) {
+  App.token = token;
+  App.me = me;
+  App.store.remove('yapp_token');
+  App.store.set('yapp_token', token, remember);
+  if (me.theme && me.theme !== App.themeMode()) App.applyTheme(me.theme);
+};
+
+App.clearSession = function () {
+  App.token = null;
+  App.me = null;
+  App.iv = '';
+  App.inbox = { items: [], unreadTotal: 0, notifUnread: 0 };
+  App.syncState.booted = false;
+  App.store.remove('yapp_token');
+};
+
+App.onAuthLost = function (message) {
+  App.clearSession();
+  App.teardownShell();
+  App.toast(message || 'Sesi berakhir. Silakan login kembali.', 'error');
+  App.go('login');
+};
+
+App.logout = function () {
+  var done = function () { App.clearSession(); App.teardownShell(); App.go('login'); };
+  App.api('auth.logout').then(done, done);
+};
+
+/* ---------- Mulai ---------- */
+App.initialHash = function () {
+  return new Promise(function (resolve) {
+    try {
+      if (google.script.url) return google.script.url.getLocation(function (loc) { resolve(loc.hash || ''); });
+    } catch (e) {}
+    resolve((location.hash || '').replace(/^#/, ''));
+  });
+};
+
+App.init = function () {
+  App.applyTheme(App.themeMode());
+  try {
+    if (google.script.history) {
+      google.script.history.setChangeHandler(function (e) { App.render((e.location && e.location.hash) || ''); });
+    }
+  } catch (e) {
+    window.addEventListener('hashchange', function () { App.render(location.hash); });
+  }
+
+  if (App.boot.page === 'reset') return App.render('reset');
+
+  App.token = App.store.get('yapp_token');
+  App.initialHash().then(function (hash) {
+    if (!App.token) return App.render(App.publicPaths.indexOf(App.parse(hash).name) >= 0 ? hash : 'login');
+    document.getElementById('app').innerHTML =
+      '<div class="auth-wrap"><div class="boot-loader">' + App.logo(54) + '<span>Memuat YAPP…</span></div></div>';
+    App.api('auth.me').then(function (me) {
+      App.me = me;
+      if (me.theme) App.applyTheme(me.theme);
+      App.render(hash && App.publicPaths.indexOf(App.parse(hash).name) < 0 ? hash : 'dashboard');
+    }).catch(function () {
+      App.clearSession();
+      App.render('login');
+    });
+  });
+};
+</script>

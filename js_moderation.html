@@ -1,0 +1,169 @@
+<script>
+/* js_moderation — Tahap 4: laporkan konten, halaman Moderasi, pencarian global. */
+(function () {
+  var api = App.api, $ = App.$, $$ = App.$$, ic = App.icon;
+
+  var REASONS = {
+    spam: 'Spam atau promosi',
+    kasar: 'Kata-kata kasar / pelecehan',
+    sara: 'SARA / ujaran kebencian',
+    tidak_pantas: 'Konten tidak pantas',
+    plagiat: 'Plagiat / pelanggaran hak cipta',
+    lainnya: 'Lainnya'
+  };
+
+  /** Sorot kata kunci tanpa merusak escape HTML: teks dipecah dulu, tiap bagian di-escape. */
+  var highlight = function (text, q) {
+    text = String(text || '');
+    if (!q) return esc(text);
+    var lower = text.toLowerCase(), needle = q.toLowerCase(), out = '', i = 0, j;
+    while ((j = lower.indexOf(needle, i)) >= 0) {
+      out += esc(text.slice(i, j)) + '<mark>' + esc(text.slice(j, j + needle.length)) + '</mark>';
+      i = j + needle.length;
+    }
+    return out + esc(text.slice(i));
+  };
+  App.highlight = highlight;
+
+  /* ---------- Laporkan konten ---------- */
+  App.report = function (targetType, targetId, label) {
+    App.modal({
+      title: 'Laporkan ' + label, confirm: 'Kirim laporan',
+      body: '<p class="muted small" style="margin-top:0">Laporan dikirim ke moderator. Identitas Anda tidak ditampilkan kepada yang dilaporkan.</p>' +
+        '<div class="field"><label>Alasan</label><select class="input" name="reason" required><option value="">Pilih alasan</option>' +
+        Object.keys(REASONS).map(function (k) { return '<option value="' + k + '">' + esc(REASONS[k]) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label>Keterangan <span class="muted">(opsional, wajib untuk "Lainnya")</span></label>' +
+        '<textarea class="input" name="note" maxlength="500" placeholder="Jelaskan singkat apa yang melanggar"></textarea></div>',
+      onConfirm: function (f) {
+        return api('reports.create', { targetType: targetType, targetId: targetId, reason: f.reason, note: f.note })
+          .then(function (res) { App.toast(res.message, 'success'); });
+      }
+    });
+  };
+
+  /* ---------- Pencarian global ---------- */
+  App.globalSearch = function (initial) {
+    var dlg = App.dialog({
+      title: 'Cari di ' + (App.boot.appName || 'YAPP'), wide: true,
+      body: '<input class="input" id="gs-q" placeholder="Cari anggota, topik, materi, grup, pengumuman, agenda, atau pesan…" autocomplete="off">' +
+        '<div id="gs-res" class="gs-results"><div class="empty small">Ketik minimal 2 huruf. Tekan Ctrl+K kapan saja untuk membuka pencarian.</div></div>'
+    });
+    var input = $('#gs-q'), box = $('#gs-res'), t = null, seq = 0;
+    if (initial) input.value = initial;
+    var go = function (path) { dlg.close(); App.go(path); };
+    var section = function (title, data, render) {
+      if (!data.total) return '';
+      return '<div class="gs-sec"><div class="gs-head"><span>' + esc(title) + '</span><small>' + data.total + ' hasil' +
+        (data.total > data.items.length ? ' · menampilkan ' + data.items.length : '') + '</small></div>' + data.items.map(render).join('') + '</div>';
+    };
+    var row = function (path, left, main, sub) {
+      return '<button type="button" class="gs-item" data-path="' + esc(path) + '">' + left + '<span class="meta"><b>' + main + '</b>' +
+        (sub ? '<small>' + sub + '</small>' : '') + '</span></button>';
+    };
+    var run = function () {
+      var q = input.value.trim();
+      if (q.length < 2) { box.innerHTML = '<div class="empty small">Ketik minimal 2 huruf.</div>'; return; }
+      var my = ++seq;
+      box.innerHTML = '<div class="empty small"><span class="spinner"></span> Mencari…</div>';
+      api('search.all', { q: q }).then(function (d) {
+        if (my !== seq) return;
+        var html =
+          section('Anggota', d.members, function (m) {
+            return row('members/' + m.user_id, App.avatar(m, 34), highlight(m.full_name, q), '@' + highlight(m.username, q) + ' · Angkatan ' + esc(m.angkatan) + (m.jabatan ? ' · ' + highlight(m.jabatan, q) : ''));
+          }) +
+          section('Forum', d.topics, function (x) {
+            return row('forum/' + x.disc_id, '<span class="gs-ic">' + ic('reply', 18) + '</span>', highlight(x.title, q), esc(x.cat_name) + ' · ' + x.reply_count + ' balasan · ' + highlight(x.excerpt, q));
+          }) +
+          section('Pesan Anda', d.messages, function (x) {
+            return row('chat/' + x.conv_id, '<span class="gs-ic">' + ic('send', 16) + '</span>', esc(x.conv_name) + ' · ' + esc(x.sender_name), highlight(x.body, q) + ' · ' + esc(App.timeAgo(x.created_at)));
+          }) +
+          section('Grup', d.groups, function (x) {
+            return row(x.is_member ? 'chat/' + x.conv_id : 'groups', App.avatar({ full_name: x.name, photo_file_id: x.photo_file_id }, 34, false, true),
+              highlight(x.name, q), (x.is_member ? 'Anda anggota' : 'Grup publik — buka halaman Grup untuk bergabung') + (x.excerpt ? ' · ' + highlight(x.excerpt, q) : ''));
+          }) +
+          section('Materi', d.resources, function (x) {
+            return row('resources', '<span class="gs-ic">' + ic(x.kind === 'link' ? 'info' : 'file', 18) + '</span>', highlight(x.title, q), esc(x.cat_name) + (x.excerpt ? ' · ' + highlight(x.excerpt, q) : ''));
+          }) +
+          section('Pengumuman', d.announcements, function (x) {
+            return row('announcements', '<span class="gs-ic">' + ic('info', 18) + '</span>', highlight(x.title, q), highlight(x.excerpt, q));
+          }) +
+          section('Agenda', d.events, function (x) {
+            return row('events/' + x.event_id, '<span class="gs-ic">' + ic('clock', 18) + '</span>', highlight(x.title, q),
+              esc(new Date(x.start_at).toLocaleString('id-ID', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })) + ' · ' + highlight(x.location, q));
+          });
+        box.innerHTML = html || '<div class="empty small">Tidak ada hasil untuk "' + esc(q) + '".</div>';
+        $$('[data-path]', box).forEach(function (b) { b.onclick = function () { go(b.dataset.path); }; });
+        App.hydrateAvatars(box);
+      }).catch(function (err) { box.innerHTML = '<div class="alert alert-error">' + esc(err.message) + '</div>'; });
+    };
+    input.oninput = function () { clearTimeout(t); t = setTimeout(run, 350); };
+    input.focus();
+    if (initial) run();
+  };
+
+  document.addEventListener('keydown', function (e) {
+    if (!App.me || !App.shellReady) return;
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); App.globalSearch(); }
+  });
+
+  /* ---------- Halaman Moderasi ---------- */
+  var mTab = 'open';
+  var ACTION_LABEL = { remove: 'Konten dihapus', warn: 'Peringatan dikirim', dismiss: 'Tidak melanggar' };
+  var TYPE_LABEL = { discussion: 'Topik forum', comment: 'Balasan forum', message: 'Pesan chat', resource: 'Materi', user: 'Anggota' };
+
+  function viewModeration(main) {
+    api('moderation.list', { status: mTab === 'open' ? 'open' : 'closed' }).then(function (d) {
+      App.setBadge(['badge-reports'], d.openCount);
+      var card = function (x) {
+        var s = x.snapshot || {};
+        return '<div class="card card-pad mod-card">' +
+          '<div class="topic-top"><span class="chip chip-blue">' + esc(x.type_label) + '</span>' +
+          (mTab === 'open' ? '<span class="chip chip-red">' + x.count + ' laporan</span>' : '<span class="chip ' +
+            (x.action === 'dismiss' ? '' : 'chip-green') + '">' + esc(ACTION_LABEL[x.action] || x.status) + '</span>') +
+          x.reasons.map(function (r) { return '<span class="chip">' + esc(r.label) + (r.count > 1 ? ' ×' + r.count : '') + '</span>'; }).join('') + '</div>' +
+          '<h2 style="margin:12px 0 6px">' + esc(s.title || x.type_label) + '</h2>' +
+          '<blockquote class="mod-quote">' + esc(s.text || '') + '</blockquote>' +
+          '<div class="topic-meta">' + App.avatar(x.author, 24) + '<span>Ditulis oleh <b>' + esc(x.author.full_name) + '</b></span><span class="sp"></span>' +
+          '<span>' + (mTab === 'open' ? 'Dilaporkan ' + esc(App.timeAgo(x.last_at)) : 'Ditangani ' + esc(x.handled_by) + ' · ' + esc(App.timeAgo(x.handled_at))) + '</span></div>' +
+          (x.notes.length ? '<div class="mod-notes">' + x.notes.slice(0, 5).map(function (n) { return '<div>“' + esc(n) + '”</div>'; }).join('') + '</div>' : '') +
+          (mTab === 'open' ? '<div class="res-actions" style="margin-top:14px">' +
+            (s.link ? '<button class="btn btn-sm" data-view="' + esc(s.link) + '">Lihat konteks</button>' : '') +
+            (x.can_remove ? '<button class="btn btn-sm btn-primary" data-act="remove" data-t="' + esc(x.target_type) + '" data-id="' + esc(x.target_id) + '">' + ic('trash', 14) + ' Hapus konten</button>' : '') +
+            '<button class="btn btn-sm" data-act="warn" data-t="' + esc(x.target_type) + '" data-id="' + esc(x.target_id) + '">Beri peringatan</button>' +
+            '<button class="btn btn-sm btn-ghost" data-act="dismiss" data-t="' + esc(x.target_type) + '" data-id="' + esc(x.target_id) + '">Abaikan</button>' +
+            (x.target_type === 'user' && App.isAdmin() ? '<button class="btn btn-sm btn-ghost" data-view="admin/users">Kelola akun</button>' : '') +
+            '</div>' : '') + '</div>';
+      };
+      main.innerHTML = '<div class="main-inner" style="max-width:900px"><div class="page-head"><div><h1>Moderasi</h1>' +
+        '<p>Tinjau laporan dari anggota. Penulis konten dan pelapor otomatis diberi tahu hasilnya.</p></div>' +
+        '<button class="btn" data-view="resources/pending">Materi menunggu persetujuan</button></div>' +
+        '<div class="tabs"><a class="tab' + (mTab === 'open' ? ' active' : '') + '" data-tab="open">Perlu ditinjau (' + d.openCount + ')</a>' +
+        '<a class="tab' + (mTab === 'closed' ? ' active' : '') + '" data-tab="closed">Riwayat</a></div>' +
+        (d.items.length ? d.items.map(card).join('') : '<div class="card"><div class="empty">' + ic('check', 26) + '<p>' +
+          (mTab === 'open' ? 'Tidak ada laporan yang perlu ditinjau.' : 'Belum ada laporan yang ditangani.') + '</p></div></div>') + '</div>';
+      App.hydrateAvatars(main);
+      $$('[data-tab]', main).forEach(function (t) { t.onclick = function () { mTab = t.dataset.tab; viewModeration(main); }; });
+      $$('[data-view]', main).forEach(function (b) { b.onclick = function () { App.go(b.dataset.view); }; });
+      $$('[data-act]', main).forEach(function (b) {
+        b.onclick = function () {
+          var act = b.dataset.act;
+          var titles = { remove: 'Hapus konten yang dilaporkan?', warn: 'Kirim peringatan ke penulis', dismiss: 'Abaikan laporan?' };
+          App.modal({
+            title: titles[act], confirm: act === 'remove' ? 'Hapus' : (act === 'warn' ? 'Kirim peringatan' : 'Abaikan'),
+            body: act === 'dismiss' ? '<p style="margin:0">Laporan ditutup sebagai "tidak melanggar". Pelapor akan diberi tahu.</p>'
+              : '<div class="field"><label>Alasan (dikirim ke penulis konten)</label><textarea class="input" name="reason" maxlength="300" required></textarea></div>',
+            onConfirm: function (f) {
+              return api('moderation.resolve', { targetType: b.dataset.t, targetId: b.dataset.id, action: act, reason: f.reason || '' })
+                .then(function () { App.toast('Laporan ditangani.', 'success'); viewModeration(main); });
+            }
+          });
+        };
+      });
+    }).catch(function (err) {
+      main.innerHTML = '<div class="main-inner"><div class="alert alert-error">' + esc(err.message) + '</div></div>';
+    });
+  }
+
+  App.routes.moderation = { title: 'Moderasi', view: viewModeration, mod: true };
+})();
+</script>
